@@ -1,13 +1,51 @@
 #!/bin/bash
 set -o pipefail
 
+usage() {
+    cat <<'EOF'
+Usage: hm [-c|--clean]
+
+Options:
+  -c, --clean   strip the #UH# prefix from Server entries without removing actual uncommented mirrors
+  -h, --help    show this help message
+EOF
+}
+
+CLEAN=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--clean)
+            CLEAN=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
 API='https://dashboard.cachyos.org/api/v1/mirrors'
 MIRRORLIST='/etc/pacman.d/cachyos-mirrorlist'
 MARK='#UH#'
 
+# Remove only the marker prefix from previously flagged mirrors
+if [[ "$CLEAN" -eq 1 ]]; then
+    sudo sed -i "s/^${MARK}//" "$MIRRORLIST" || exit 1
+    exit 0
+fi
+
+
 TMP=$(mktemp)
 SED=$(mktemp)
 trap 'rm -f "$TMP" "$SED"' EXIT
+
+
 
 # Get healthy mirrors
 curl -fsSL "$API" |
