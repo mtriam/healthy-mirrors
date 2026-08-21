@@ -31,21 +31,25 @@ while [[ $# -gt 0 ]]; do
 done
 
 API='https://dashboard.cachyos.org/api/v1/mirrors'
-MIRRORLIST='/etc/pacman.d/cachyos-mirrorlist'
+MIRRORLISTS=(
+    /etc/pacman.d/cachyos-mirrorlist
+    /etc/pacman.d/cachyos-v3-mirrorlist
+    /etc/pacman.d/cachyos-v4-mirrorlist
+)
 MARK='#UH#'
 
 # Remove only the marker prefix from previously flagged mirrors
 if [[ "$CLEAN" -eq 1 ]]; then
-    sudo sed -i "s/^${MARK}//" "$MIRRORLIST" || exit 1
+    for mirrorlist in "${MIRRORLISTS[@]}"; do
+        [[ -f "$mirrorlist" ]] || continue
+        sudo sed -i "s/^${MARK}//" "$mirrorlist" || exit 1
+    done
     exit 0
 fi
-
 
 TMP=$(mktemp)
 SED=$(mktemp)
 trap 'rm -f "$TMP" "$SED"' EXIT
-
-
 
 # Get healthy mirrors
 curl -fsSL "$API" |
@@ -60,12 +64,19 @@ while read -r url; do
     printf 's|^%sServer = %s/|Server = %s/|\n' "$MARK" "$url" "$url"
 done < "$TMP" >> "$SED" || exit 1
 
-sudo sed -i -f "$SED" "$MIRRORLIST" || exit 1
+# Apply to all mirrorlists
+for mirrorlist in "${MIRRORLISTS[@]}"; do
+    [[ -f "$mirrorlist" ]] || continue
+    sudo sed -i -f "$SED" "$mirrorlist" || exit 1
+done
 
-# Count commented mirrors (lines still prefixed with MARK)
-commented_count=$(sudo grep -c "^${MARK}Server = " "$MIRRORLIST" || true)
+echo "Mirror lists cleaned."
 
-# Count active mirrors (uncommented Server lines)
-active_count=$(sudo grep -c "^Server = " "$MIRRORLIST" || true)
+for mirrorlist in "${MIRRORLISTS[@]}"; do
+    [[ -f "$mirrorlist" ]] || continue
 
-echo "Mirror list cleaned. Active mirrors: $active_count. Commented mirrors: $commented_count"
+    commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
+    active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
+
+    echo "$(basename "$mirrorlist"): Active: $active_count. Commented: $commented_count"
+done
