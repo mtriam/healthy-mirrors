@@ -26,6 +26,16 @@ chmod +x ~/.local/bin/hm
 
 ## Use
 
+If installed to `~/.local/bin`, run:
+
+```bash
+~/.local/bin/hm
+~/.local/bin/hm --clean
+~/.local/bin/hm -c
+```
+
+If you added `~/.local/bin` to `PATH`, you can use:
+
 ```bash
 hm
 hm --clean
