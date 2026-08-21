@@ -36,20 +36,20 @@ hm -c
 
 ## Alias
 
-`up` refreshes the healthy mirror list first, then runs the system upgrade.
-It can also be used to install a package by passing it as an argument.
+`up` refreshes the healthy mirror list, runs the system upgrade or package install, and finally restores the original mirrorlist state with `hm -c`.
 
 zsh:
 
 ```bash
-echo 'alias up="~/.local/bin/hm && sudo pacman -Syu"' >> ~/.zshrc
+echo 'up() { ~/.local/bin/hm && sudo pacman -Syu "$@"; ~/.local/bin/hm -c; }' >> ~/.zshrc
 source ~/.zshrc
 ```
 
 fish:
 
 ```bash
-func up; ~/.local/bin/hm; and sudo pacman -Syu $argv; end
+echo 'function up; ~/.local/bin/hm; and sudo pacman -Syu $argv; or true; ~/.local/bin/hm -c; end' >> ~/.config/fish/config.fish
+source ~/.config/fish/config.fish
 ```
 
 Examples:
