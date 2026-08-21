@@ -1,0 +1,33 @@
+#!/bin/bash
+set -o pipefail
+
+API='https://dashboard.cachyos.org/api/v1/mirrors'
+MIRRORLIST='/etc/pacman.d/cachyos-mirrorlist'
+MARK='#UH#'
+
+TMP=$(mktemp)
+SED=$(mktemp)
+trap 'rm -f "$TMP" "$SED"' EXIT
+
+# Get healthy mirrors
+curl -fsSL "$API" |
+    jq -r '.mirrors[] | select(.overall_status == "healthy") | .url' |
+    sed 's:/$::' > "$TMP" || exit 1
+
+# Remove old markers and mark all mirrors
+printf 's/^%s//\n/^Server = /s/^/%s/\n' "$MARK" "$MARK" > "$SED"
+
+# Unmark healthy mirrors
+while read -r url; do
+    printf 's|^%sServer = %s/|Server = %s/|\n' "$MARK" "$url" "$url"
+done < "$TMP" >> "$SED" || exit 1
+
+sudo sed -i -f "$SED" "$MIRRORLIST" || exit 1
+
+# Count commented mirrors (lines still prefixed with MARK)
+commented_count=$(sudo grep -c "^${MARK}Server = " "$MIRRORLIST" || true)
+
+# Count active mirrors (uncommented Server lines)
+active_count=$(sudo grep -c "^Server = " "$MIRRORLIST" || true)
+
+echo "Mirror list cleaned. Active mirrors: $active_count. Commented mirrors: $commented_count"
