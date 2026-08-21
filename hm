@@ -70,13 +70,10 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     sudo sed -i -f "$SED" "$mirrorlist" || exit 1
 done
 
-echo "Mirror lists cleaned."
+# Count commented mirrors (lines still prefixed with MARK)
+commented_count=$(sudo grep -c "^${MARK}Server = " "${MIRRORLISTS[0]}" || true)
 
-for mirrorlist in "${MIRRORLISTS[@]}"; do
-    [[ -f "$mirrorlist" ]] || continue
+# Count active mirrors (uncommented Server lines)
+active_count=$(sudo grep -c "^Server = " "${MIRRORLISTS[0]}" || true)
 
-    commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
-    active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
-
-    echo "$(basename "$mirrorlist"): Active: $active_count. Commented: $commented_count"
-done
+echo "+++ Mirror lists cleaned: ${active_count} active, ${commented_count} commented +++"
