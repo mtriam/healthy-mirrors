@@ -52,7 +52,7 @@ SED=$(mktemp)
 trap 'rm -f "$TMP" "$SED"' EXIT
 
 # Get healthy mirrors
-curl -fsSL "$API" |
+curl --connect-timeout 5 --max-time 10 -fsSL "$API" |
     jq -r '.mirrors[] | select(.overall_status == "healthy") | .url' |
     sed 's:/$::' > "$TMP" || exit 1
 

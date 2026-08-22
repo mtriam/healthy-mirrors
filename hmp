@@ -1,0 +1,131 @@
+#!/bin/bash
+set -o pipefail
+
+usage() {
+    cat <<'EOF'
+Usage: hmp [-c|--clean]
+
+Options:
+  -c, --clean   strip the #UH# prefix from Server entries without removing actual uncommented mirrors
+  -h, --help    show this help message
+EOF
+}
+
+CLEAN=0
+while [[ $# -gt 0 ]]; do
+    case "$1" in
+        -c|--clean)
+            CLEAN=1
+            ;;
+        -h|--help)
+            usage
+            exit 0
+            ;;
+        *)
+            echo "Unknown option: $1" >&2
+            usage >&2
+            exit 1
+            ;;
+    esac
+    shift
+done
+
+API='https://dashboard.cachyos.org/api/v1/mirrors'
+MIRRORLISTS=(
+    /etc/pacman.d/cachyos-mirrorlist
+    /etc/pacman.d/cachyos-v3-mirrorlist
+    /etc/pacman.d/cachyos-v4-mirrorlist
+)
+MARK='#UH#'
+
+# Remove only the marker prefix from previously flagged mirrors
+if [[ "$CLEAN" -eq 1 ]]; then
+    for mirrorlist in "${MIRRORLISTS[@]}"; do
+        [[ -f "$mirrorlist" ]] || continue
+        sudo sed -i "s/^${MARK}//" "$mirrorlist" || exit 1
+    done
+    exit 0
+fi
+
+JSON=$(mktemp)
+TMP=$(mktemp)
+TMP_V3=$(mktemp)
+TMP_V4=$(mktemp)
+SED=$(mktemp)
+trap 'rm -f "$JSON" "$TMP" "$TMP_V3" "$TMP_V4" "$SED"' EXIT
+
+# Get mirror status
+curl --connect-timeout 5 --max-time 10 -fsSL "$API" > "$JSON" || exit 1
+
+# Get mirrors where all repositories for the architecture are synced
+jq -r '
+    .mirrors[]
+    | [ .checks[]
+        | select(.path | startswith("x86_64/"))
+        | .status
+      ] as $c
+    | select($c | length > 0 and all(. == "synced"))
+    | .url
+' "$JSON" | sed 's:/$::' > "$TMP" || exit 1
+
+jq -r '
+    .mirrors[]
+    | [ .checks[]
+        | select(.path | startswith("x86_64_v3/"))
+        | .status
+      ] as $c
+    | select($c | length > 0 and all(. == "synced"))
+    | .url
+' "$JSON" | sed 's:/$::' > "$TMP_V3" || exit 1
+
+jq -r '
+    .mirrors[]
+    | [ .checks[]
+        | select(.path | startswith("x86_64_v4/"))
+        | .status
+      ] as $c
+    | select($c | length > 0 and all(. == "synced"))
+    | .url
+' "$JSON" | sed 's:/$::' > "$TMP_V4" || exit 1
+
+# Apply status to each mirrorlist
+for i in "${!MIRRORLISTS[@]}"; do
+    mirrorlist="${MIRRORLISTS[$i]}"
+    [[ -f "$mirrorlist" ]] || continue
+
+    case "$i" in
+        0) healthy="$TMP" ;;
+        1) healthy="$TMP_V3" ;;
+        2) healthy="$TMP_V4" ;;
+    esac
+
+    # Remove old markers and mark all mirrors
+    printf 's/^%s//\n/^Server = /s/^/%s/\n' "$MARK" "$MARK" > "$SED"
+
+    # Unmark mirrors healthy for this architecture
+    while read -r url; do
+        printf 's|^%sServer = %s/|Server = %s/|\n' \
+            "$MARK" "$url" "$url"
+    done < "$healthy" >> "$SED" || exit 1
+
+    sudo sed -i -f "$SED" "$mirrorlist" || exit 1
+done
+
+printf '======= Mirror lists =======\n'
+printf '%-12s %6s %8s\n' "Repo" "Active" "Disabled"
+printf '%-12s %6s %8s\n' "------------" "------" "--------"
+
+for i in "${!MIRRORLISTS[@]}"; do
+    mirrorlist="${MIRRORLISTS[$i]}"
+    [[ -f "$mirrorlist" ]] || continue
+
+    repo_name=$(basename "$mirrorlist" "-mirrorlist")
+
+    commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
+    active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
+
+    printf '%-12s %6s %8s\n' \
+        "$repo_name" "$active_count" "$commented_count"
+done
+
+printf '============================\n'

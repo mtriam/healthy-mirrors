@@ -16,12 +16,28 @@ It also prints how many mirrors are active and how many remain commented out.
 - `grep`
 - `sudo`
 
+## Variants
+
+There are two variants of the script:
+
+- `hm` — simple, strict mode, keeps only mirrors whose `overall_status` is `healthy`.
+- `hmp` — architecture-aware mode, checks repository synchronization separately for `x86_64`, `x86_64_v3`, and `x86_64_v4`, and keeps mirrors that are fully synchronized for the corresponding architecture.
+
+This makes `hmp` suitable for mirrors that are partially synchronized overall but still fully synchronized and usable for a specific architecture.
+
 ## Install
 
 ```bash
 mkdir -p ~/.local/bin
 wget -O ~/.local/bin/hm https://raw.githubusercontent.com/mtriam/healthy-mirrors/refs/heads/main/hm
 chmod +x ~/.local/bin/hm
+```
+
+For the partial-sync-aware variant:
+
+```bash
+wget -O ~/.local/bin/hmp https://raw.githubusercontent.com/mtriam/healthy-mirrors/refs/heads/main/hmp
+chmod +x ~/.local/bin/hmp
 ```
 
 ## Use
@@ -32,6 +48,9 @@ If installed to `~/.local/bin`, run:
 ~/.local/bin/hm
 ~/.local/bin/hm --clean
 ~/.local/bin/hm -c
+~/.local/bin/hmp
+~/.local/bin/hmp --clean
+~/.local/bin/hmp -c
 ```
 
 If you added `~/.local/bin` to `PATH`, you can use:
@@ -40,6 +59,9 @@ If you added `~/.local/bin` to `PATH`, you can use:
 hm
 hm --clean
 hm -c
+hmp
+hmp --clean
+hmp -c
 ```
 
 `-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirror entries.
