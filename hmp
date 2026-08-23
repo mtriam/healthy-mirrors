@@ -111,10 +111,8 @@ for i in "${!MIRRORLISTS[@]}"; do
     sudo sed -i -f "$SED" "$mirrorlist" || exit 1
 done
 
-printf '======= Mirror lists =======\n'
-printf '%-12s %6s %8s\n' "Repo" "Active" "Disabled"
-printf '%-12s %6s %8s\n' "------------" "------" "--------"
-
+printf '==== mirror summary (\033[92mon\033[0m/\033[91moff\033[0m): '
+first=1
 for i in "${!MIRRORLISTS[@]}"; do
     mirrorlist="${MIRRORLISTS[$i]}"
     [[ -f "$mirrorlist" ]] || continue
@@ -124,8 +122,11 @@ for i in "${!MIRRORLISTS[@]}"; do
     commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
     active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
 
-    printf '%-12s %6s %8s\n' \
+    if [[ $first -eq 0 ]]; then
+        printf ' | '
+    fi
+    printf '%s (\033[92m%s\033[0m/\033[91m%s\033[0m)' \
         "$repo_name" "$active_count" "$commented_count"
+    first=0
 done
-
-printf '============================\n'
+printf ' ====\n'
