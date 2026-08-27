@@ -1,12 +1,12 @@
 # healthy-mirrors
 
-Checks CachyOS mirror health and automatically marks out-of-sync or unhealthy mirrors in the mirrorlist, leaving only healthy mirrors active to help prevent partial upgrades and system breakage.
+Checks mirror health and automatically keeps only healthy mirrors active, helping avoid partial upgrades and broken system states.
 
 ## What it does
 
-The script fetches the current mirror health data from the CachyOS API, keeps only entries with `overall_status == "healthy"`, and updates `/etc/pacman.d/cachyos-mirrorlist` accordingly.
+The script reads the mirror lists included from `/etc/pacman.conf`, checks the current CachyOS mirror status, and keeps only mirrors that are fully synced for the relevant architecture. It also includes healthy Arch mirrors from the Arch Linux mirror status API when applicable.
 
-It also prints how many mirrors are active and how many remain commented out.
+It then updates the mirrorlist files by commenting out unhealthy mirrors while leaving healthy ones active, and prints a summary of active vs. disabled mirrors.
 
 ## Requirements
 
@@ -16,28 +16,12 @@ It also prints how many mirrors are active and how many remain commented out.
 - `grep`
 - `sudo`
 
-## Variants
-
-There are two variants of the script:
-
-- `hm` — simple, strict mode, keeps only mirrors whose `overall_status` is `healthy`.
-- `hmp` — architecture-aware mode, checks repository synchronization separately for `x86_64`, `x86_64_v3`, and `x86_64_v4`, and keeps mirrors that are fully synchronized for the corresponding architecture.
-
-This makes `hmp` suitable for mirrors that are partially synchronized overall but still fully synchronized and usable for a specific architecture.
-
 ## Install
 
 ```bash
 mkdir -p ~/.local/bin
 wget -O ~/.local/bin/hm https://raw.githubusercontent.com/mtriam/healthy-mirrors/refs/heads/main/hm
 chmod +x ~/.local/bin/hm
-```
-
-For the partial-sync-aware variant:
-
-```bash
-wget -O ~/.local/bin/hmp https://raw.githubusercontent.com/mtriam/healthy-mirrors/refs/heads/main/hmp
-chmod +x ~/.local/bin/hmp
 ```
 
 ## Use
@@ -48,9 +32,6 @@ If installed to `~/.local/bin`, run:
 ~/.local/bin/hm
 ~/.local/bin/hm --clean
 ~/.local/bin/hm -c
-~/.local/bin/hmp
-~/.local/bin/hmp --clean
-~/.local/bin/hmp -c
 ```
 
 If you added `~/.local/bin` to `PATH`, you can use:
@@ -59,12 +40,9 @@ If you added `~/.local/bin` to `PATH`, you can use:
 hm
 hm --clean
 hm -c
-hmp
-hmp --clean
-hmp -c
 ```
 
-`-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirror entries.
+`-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirrors.
 
 ## Alias
 
@@ -87,8 +65,8 @@ source ~/.config/fish/config.fish
 Examples:
 
 ```bash
-up
-up firefox
+up           # safely upgrade the system
+up firefox   # safely install Firefox
 ```
 
 ## Optional: add to PATH

@@ -30,13 +30,30 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-API='https://dashboard.cachyos.org/api/v1/mirrors'
-MIRRORLISTS=(
-    /etc/pacman.d/cachyos-mirrorlist
-    /etc/pacman.d/cachyos-v3-mirrorlist
-    /etc/pacman.d/cachyos-v4-mirrorlist
-)
+CACHYOS_API='https://dashboard.cachyos.org/api/v1/mirrors'
+ARCH_API='https://archlinux.org/mirrors/status/json/'
 MARK='#UH#'
+
+mapfile -t MIRRORLISTS < <(
+    grep '^Include' /etc/pacman.conf |
+        sed 's/[[:space:]]*$//' |
+        sort -u |
+        sed 's/^Include[[:space:]]*=[[:space:]]*//'
+)
+
+
+# Detect terminal color support
+if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+    GREEN=$'\033[38;5;46m'
+    RED=$'\033[38;5;196m'
+    WARNING_STYLE="${RED}"
+    RESET=$'\033[0m'
+else
+    GREEN=''
+    RED=''
+    WARNING_STYLE="${RED}"
+    RESET=''
+fi
 
 # Remove only the marker prefix from previously flagged mirrors
 if [[ "$CLEAN" -eq 1 ]]; then
@@ -47,33 +64,97 @@ if [[ "$CLEAN" -eq 1 ]]; then
     exit 0
 fi
 
+JSON_CACHYOS=$(mktemp)
+JSON_ARCH=$(mktemp)
+ARCH_MIRRORS=$(mktemp)
 TMP=$(mktemp)
+TMP_V3=$(mktemp)
+TMP_V4=$(mktemp)
 SED=$(mktemp)
-trap 'rm -f "$TMP" "$SED"' EXIT
+trap 'rm -f "$JSON_CACHYOS" "$JSON_ARCH" "$ARCH_MIRRORS" "$TMP" "$TMP_V3" "$TMP_V4" "$SED"' EXIT
 
-# Get healthy mirrors
-curl --connect-timeout 5 --max-time 10 -fsSL "$API" |
-    jq -r '.mirrors[] | select(.overall_status == "healthy") | .url' |
-    sed 's:/$::' > "$TMP" || exit 1
+# Get architecture-specific CachyOS mirror status
+curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" > "$JSON_CACHYOS" || exit 1
+for architecture in x86_64 x86_64_v3 x86_64_v4; do
+    output="$TMP"
+    [[ "$architecture" == x86_64_v3 ]] && output="$TMP_V3"
+    [[ "$architecture" == x86_64_v4 ]] && output="$TMP_V4"
 
-# Remove old markers and mark all mirrors
-printf 's/^%s//\n/^Server = /s/^/%s/\n' "$MARK" "$MARK" > "$SED"
-
-# Unmark healthy mirrors
-while read -r url; do
-    printf 's|^%sServer = %s/|Server = %s/|\n' "$MARK" "$url" "$url"
-done < "$TMP" >> "$SED" || exit 1
-
-# Apply to all mirrorlists
-for mirrorlist in "${MIRRORLISTS[@]}"; do
-    [[ -f "$mirrorlist" ]] || continue
-    sudo sed -i -f "$SED" "$mirrorlist" || exit 1
+    jq -r --arg architecture "$architecture" '
+        .mirrors[]
+        | [ .checks[]
+            | select(.path | startswith($architecture + "/"))
+            | .status
+          ] as $checks
+        | select($checks | length > 0 and all(. == "synced"))
+        | .url
+    ' "$JSON_CACHYOS" | sed 's:/$::' > "$output" || exit 1
 done
 
-# Count commented mirrors (lines still prefixed with MARK)
-commented_count=$(sudo grep -c "^${MARK}Server = " "${MIRRORLISTS[0]}" || true)
+# Get healthy Arch mirrors
+curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" > "$JSON_ARCH" || exit 1
+jq -r '
+  .urls[]
+  | select(
+      .protocol == "https"
+      and .active == true
+      and .last_sync != null
+      and .completion_pct == 1.0
+      and .delay < 3600
+    )
+  | .url
+' "$JSON_ARCH" |
+sed 's:/$::' > "$ARCH_MIRRORS" || exit 1
 
-# Count active mirrors (uncommented Server lines)
-active_count=$(sudo grep -c "^Server = " "${MIRRORLISTS[0]}" || true)
+#jq -r '.urls[] | select(.protocol == "https" and .active == true and .completion_pct == 1.0 and .delay <= 3600) | .url' "$JSON_ARCH" |
+#    sed 's:/$::' 
 
-echo "+++ Mirror lists cleaned: ${active_count} active, ${commented_count} commented +++"
+sudo true || exit 1
+
+printf "==== mirror summary (${GREEN}on${RESET}/${RED}off${RESET}): "
+
+first=1
+zero_active=0
+for mirrorlist in "${MIRRORLISTS[@]}"; do
+    [[ -f "$mirrorlist" ]] || continue
+
+    if [[ "${mirrorlist,,}" != *cachyos* ]]; then
+        healthy="$ARCH_MIRRORS"
+    elif [[ "${mirrorlist,,}" == *v4* ]]; then
+        healthy="$TMP_V4"
+    elif [[ "${mirrorlist,,}" == *v3* ]]; then
+        healthy="$TMP_V3"
+    else
+        healthy="$TMP"
+    fi
+
+    # Remove old markers and mark all mirrors
+    printf 's/^%s//\n/^Server = /s/^/%s/\n' "$MARK" "$MARK" > "$SED"
+    while read -r url; do
+        printf 's|^%sServer = %s/|Server = %s/|\n' \
+            "$MARK" "$url" "$url"
+    done < "$healthy" >> "$SED" || exit 1
+
+    sudo sed -i -f "$SED" "$mirrorlist" || exit 1
+
+    commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
+    active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
+    [[ "$active_count" -eq 0 ]] && zero_active=1
+
+    [[ "$first" -eq 1 ]] || printf ' | '
+    name=$(basename "$mirrorlist")
+    [[ "$name" == "mirrorlist" ]] && name="arch"
+    name="${name%-mirrorlist}"
+
+    printf '%s (%s%s%s/%s%s%s)' \
+        "$name" "$GREEN" "$active_count" "$RESET" \
+        "$RED" "$commented_count" "$RESET"
+    first=0
+done
+printf ' ====\n'
+
+if [[ "$zero_active" -eq 1 ]]; then
+    printf '%sWARNING:%s no active mirrors available in at least one repo; try again later.\n' \
+        "$WARNING_STYLE" "$RESET"
+    exit 1
+fi
