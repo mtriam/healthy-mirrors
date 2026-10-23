@@ -24,7 +24,10 @@ Install system-wide to `/usr/local/bin`:
 curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install.sh | bash
 ```
 
-The installer asks for `sudo` only to install the file. The manual equivalent is:
+The installer asks for `sudo` only to install the file. If `hm` is next to
+`install.sh`, it uses that local file instead of downloading it. It also adds
+the `up` function to zsh and fish configuration files when it is not already
+defined and the corresponding shell is installed. The manual equivalent is:
 
 ```bash
 tmp=$(mktemp)
@@ -32,6 +35,10 @@ curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/hm -o "
 sudo install -m 755 "$tmp" /usr/local/bin/hm
 rm -f "$tmp"
 ```
+
+When the `shelly` program is installed, the installer also adds
+`alias shelly='hm && shelly'` to zsh (and an equivalent fish function), unless
+an alias or function with that name already exists.
 
 ## Uninstall
 
