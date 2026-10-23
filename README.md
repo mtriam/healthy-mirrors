@@ -33,6 +33,12 @@ sudo install -m 755 "$tmp" /usr/local/bin/hm
 rm -f "$tmp"
 ```
 
+## Uninstall
+
+```bash
+sudo rm /usr/local/bin/hm
+```
+
 ## Use
 
 Run:
