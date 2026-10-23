@@ -57,10 +57,35 @@ fi
 
 # Remove only the marker prefix from previously flagged mirrors
 if [[ "$CLEAN" -eq 1 ]]; then
+    changed=0
+    declare -a CLEAN_TARGETS=()
+    declare -a CLEAN_CANDIDATES=()
     for mirrorlist in "${MIRRORLISTS[@]}"; do
         [[ -f "$mirrorlist" ]] || continue
-        sudo sed -i "s/^${MARK}//" "$mirrorlist" || exit 1
+        candidate=$(mktemp)
+        sed "s/^${MARK}//" "$mirrorlist" > "$candidate" || exit 1
+        if ! cmp -s "$mirrorlist" "$candidate"; then
+            changed=1
+            CLEAN_TARGETS+=("$mirrorlist")
+            CLEAN_CANDIDATES+=("$candidate")
+        else
+            rm -f "$candidate"
+        fi
     done
+
+    if [[ "$changed" -eq 1 ]]; then
+        if [[ "$EUID" -ne 0 ]]; then
+            sudo -v || exit 1
+        fi
+        for i in "${!CLEAN_TARGETS[@]}"; do
+            if [[ "$EUID" -eq 0 ]]; then
+                cp "${CLEAN_CANDIDATES[$i]}" "${CLEAN_TARGETS[$i]}"
+            else
+                sudo cp "${CLEAN_CANDIDATES[$i]}" "${CLEAN_TARGETS[$i]}"
+            fi
+            rm -f "${CLEAN_CANDIDATES[$i]}" || exit 1
+        done
+    fi
     exit 0
 fi
 
@@ -71,7 +96,7 @@ TMP=$(mktemp)
 TMP_V3=$(mktemp)
 TMP_V4=$(mktemp)
 SED=$(mktemp)
-trap 'rm -f "$JSON_CACHYOS" "$JSON_ARCH" "$ARCH_MIRRORS" "$TMP" "$TMP_V3" "$TMP_V4" "$SED"' EXIT
+trap 'rm -f "$JSON_CACHYOS" "$JSON_ARCH" "$ARCH_MIRRORS" "$TMP" "$TMP_V3" "$TMP_V4" "$SED" "${CANDIDATES[@]}"' EXIT
 
 # Get architecture-specific CachyOS mirror status
 curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" > "$JSON_CACHYOS" || exit 1
@@ -109,12 +134,12 @@ sed 's:/$::' > "$ARCH_MIRRORS" || exit 1
 #jq -r '.urls[] | select(.protocol == "https" and .active == true and .completion_pct == 1.0 and .delay <= 3600) | .url' "$JSON_ARCH" |
 #    sed 's:/$::' 
 
-sudo true || exit 1
-
-printf "==== mirror summary (${GREEN}on${RESET}/${RED}off${RESET}): "
-
+SUMMARY=''
 first=1
 zero_active=0
+changed=0
+declare -a TARGETS=()
+declare -a CANDIDATES=()
 for mirrorlist in "${MIRRORLISTS[@]}"; do
     [[ -f "$mirrorlist" ]] || continue
 
@@ -135,23 +160,46 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
             "$MARK" "$url" "$url"
     done < "$healthy" >> "$SED" || exit 1
 
-    sudo sed -i -f "$SED" "$mirrorlist" || exit 1
+    candidate=$(mktemp)
+    sed -f "$SED" "$mirrorlist" > "$candidate" || exit 1
 
-    commented_count=$(sudo grep -c "^${MARK}Server = " "$mirrorlist" || true)
-    active_count=$(sudo grep -c "^Server = " "$mirrorlist" || true)
+    commented_count=$(grep -c "^${MARK}Server = " "$candidate" || true)
+    active_count=$(grep -c "^Server = " "$candidate" || true)
     [[ "$active_count" -eq 0 ]] && zero_active=1
 
-    [[ "$first" -eq 1 ]] || printf ' | '
+    if ! cmp -s "$mirrorlist" "$candidate"; then
+        changed=1
+        TARGETS+=("$mirrorlist")
+        CANDIDATES+=("$candidate")
+    else
+        rm -f "$candidate"
+    fi
+
     name=$(basename "$mirrorlist")
     [[ "$name" == "mirrorlist" ]] && name="arch"
     name="${name%-mirrorlist}"
 
-    printf '%s (%s%s%s/%s%s%s)' \
+    [[ "$first" -eq 1 ]] || SUMMARY+=' | '
+    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s)' \
         "$name" "$GREEN" "$active_count" "$RESET" \
-        "$RED" "$commented_count" "$RESET"
+        "$RED" "$commented_count" "$RESET")
     first=0
 done
-printf ' ====\n'
+
+if [[ "$changed" -eq 1 ]]; then
+    if [[ "$EUID" -ne 0 ]]; then
+        sudo -v || exit 1
+    fi
+    for i in "${!TARGETS[@]}"; do
+        if [[ "$EUID" -eq 0 ]]; then
+            cp "${CANDIDATES[$i]}" "${TARGETS[$i]}"
+        else
+            sudo cp "${CANDIDATES[$i]}" "${TARGETS[$i]}"
+        fi
+    done
+fi
+
+printf "==== mirror summary (${GREEN}on${RESET}/${RED}off${RESET}): %s ====\n" "$SUMMARY"
 
 if [[ "$zero_active" -eq 1 ]]; then
     printf '%sWARNING:%s no active mirrors available in at least one repo; try again later.\n' \

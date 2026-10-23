@@ -14,27 +14,28 @@ It then updates the mirrorlist files by commenting out unhealthy mirrors while l
 - `jq`
 - `sed`
 - `grep`
-- `sudo`
+- `sudo` (only when mirrorlist files actually need updating)
 
 ## Install
 
+Install system-wide to `/usr/local/bin`:
+
 ```bash
-mkdir -p ~/.local/bin
-wget -O ~/.local/bin/hm https://raw.githubusercontent.com/mtriam/healthy-mirrors/refs/heads/main/hm
-chmod +x ~/.local/bin/hm
+curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install.sh | bash
+```
+
+The installer asks for `sudo` only to install the file. The manual equivalent is:
+
+```bash
+tmp=$(mktemp)
+curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/hm -o "$tmp"
+sudo install -m 755 "$tmp" /usr/local/bin/hm
+rm -f "$tmp"
 ```
 
 ## Use
 
-If installed to `~/.local/bin`, run:
-
-```bash
-~/.local/bin/hm
-~/.local/bin/hm --clean
-~/.local/bin/hm -c
-```
-
-If you added `~/.local/bin` to `PATH`, you can use:
+Run:
 
 ```bash
 hm
@@ -42,7 +43,7 @@ hm --clean
 hm -c
 ```
 
-`-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirrors.
+`-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirrors. Both modes compare the generated result with the current file first, so an unchanged run does not ask for `sudo`.
 
 ## Alias
 
@@ -51,14 +52,14 @@ hm -c
 zsh:
 
 ```bash
-echo 'up() { ~/.local/bin/hm && sudo pacman -Syu "$@"; ~/.local/bin/hm -c; }' >> ~/.zshrc
+echo 'up() { hm && sudo pacman -Syu "$@"; hm -c; }' >> ~/.zshrc
 source ~/.zshrc
 ```
 
 fish:
 
 ```bash
-echo 'function up; ~/.local/bin/hm; and sudo pacman -Syu $argv; or true; ~/.local/bin/hm -c; end' >> ~/.config/fish/config.fish
+echo 'function up; hm; and sudo pacman -Syu $argv; or true; hm -c; end' >> ~/.config/fish/config.fish
 source ~/.config/fish/config.fish
 ```
 
@@ -67,22 +68,4 @@ Examples:
 ```bash
 up           # safely upgrade the system
 up firefox   # safely install Firefox
-```
-
-## Optional: add to PATH
-
-If you want to run `hm` directly without typing the full path, add `~/.local/bin` to your shell config.
-
-zsh:
-
-```bash
-echo 'export PATH="$HOME/.local/bin:$PATH"' >> ~/.zshrc
-source ~/.zshrc
-```
-
-fish:
-
-```bash
-echo 'set -gx PATH $HOME/.local/bin $PATH' >> ~/.config/fish/config.fish
-source ~/.config/fish/config.fish
 ```
