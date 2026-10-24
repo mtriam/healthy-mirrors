@@ -1,12 +1,15 @@
 #!/usr/bin/python3 -u
-"""Hold open() of /etc/pacman.conf by pacman/shelly, run hm, then release."""
+"""Hold open() of /etc/pacman.conf by pacman/shelly/AUR helpers, run hm, then release."""
 import ctypes, os, re, select, signal, struct, subprocess, sys, time
 
 HM = os.environ.get("HM", "/usr/local/bin/hm")
-HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "60"))
-COOLDOWN = float(os.environ.get("COOLDOWN", "30"))   # min. seconds between hm runs
+HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "30"))
+COOLDOWN = float(os.environ.get("COOLDOWN", "60"))   # min. seconds between hm runs
 WATCH = os.environ.get("WATCH", "/etc/pacman.conf").split(":")
+# always trigger (e.g. a program that only ever syncs/downloads)
 SHELLY_RE = re.compile(os.environ.get("SHELLY_RE", r"shelly.*"), re.I)
+# trigger only when run bare/with a package name, or with a sync/upgrade operation
+HELPERS_RE = re.compile(os.environ.get("HELPERS_RE", r"yay|paru|pikaur|trizen|octopi"), re.I)
 
 FAN_CLOEXEC, FAN_CLASS_CONTENT = 0x1, 0x4
 FAN_OPEN_PERM, FAN_MARK_ADD, FAN_ALLOW = 0x10000, 0x1, 1
@@ -43,15 +46,23 @@ def proc_info(pid):
     except Exception:
         return "?", []
 
+def sync_ops(opts):
+    """True if the option list contains a sync (-S*) or upgrade (-U) operation."""
+    for a in opts:
+        if a in ("--sync", "--upgrade"):
+            return True
+        if not a.startswith("--") and re.search(r"[SU]", a):
+            return True
+    return False
+
 def should_trigger(comm, args):
+    opts = [a for a in args[1:] if a.startswith("-")]
     if comm == "pacman":
         # only operations that use mirrors: -S* and -U (not -Q, -T, -V, ...)
-        for a in args[1:]:
-            if a in ("--sync", "--upgrade"):
-                return True
-            if a.startswith("-") and not a.startswith("--") and re.search(r"[SU]", a):
-                return True
-        return False
+        return sync_ops(opts)
+    if HELPERS_RE.fullmatch(comm):
+        # no options = interactive search/install by name; otherwise only sync/upgrade
+        return not opts or sync_ops(opts)
     return bool(SHELLY_RE.fullmatch(comm))
 
 def main():

@@ -89,7 +89,7 @@ RestartSec=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 ReadWritePaths=$RW
-ProtectHome=yes
+ProtectHome=read-only
 PrivateTmp=yes
 PrivateDevices=yes
 ProtectKernelTunables=yes
@@ -99,7 +99,7 @@ ProtectControlGroups=yes
 RestrictNamespaces=yes
 RestrictRealtime=yes
 LockPersonality=yes
-CapabilityBoundingSet=CAP_SYS_ADMIN
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
 RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
 
 [Install]
@@ -118,5 +118,5 @@ fi
 EXPOSURE=$(systemd-analyze security "$SVC" --no-pager 2>/dev/null | tail -n1 | sed 's/.*: //')
 ok installed "$BIN (root:root 0755)"
 ok service   "$SVC active, enabled at boot"
-ok hardening "exposure ${EXPOSURE:-n/a}; writable: ${RW# -}" 
+ok hardening "exposure ${EXPOSURE:-n/a}; writable: ${RW#-}" 
 printf '\n%sLogs:%s   journalctl -fu %s\n%sRemove:%s %s --remove\n' "$D" "$N" "$SVC" "$D" "$N" "$SELF"
