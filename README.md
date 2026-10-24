@@ -74,6 +74,15 @@ Environment="HELPERS_RE=yay|paru"
 - `python3`
 - a kernel with fanotify permission events (`CONFIG_FANOTIFY_ACCESS_PERMISSIONS`)
 
+## Error notifications
+
+When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable API responses, failed `sudo` authentication and repositories without any active mirror. In a terminal the error is printed as usual and no notification is sent.
+
+- When run as root (by the daemon), `hm` notifies every active user session via `notify-send`, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
+- Requires `notify-send` (`libnotify`), `setpriv` and `loginctl` (`util-linux`, `systemd`), and a running notification daemon in the user session.
+- To allow this, the service unit uses `ProtectHome=read-only` (instead of `yes`) and additionally keeps `CAP_SETUID` and `CAP_SETGID`.
+- Control: `HM_NOTIFY=auto|always|never` (default `auto`). Send a test notification with `hm --notify-test`.
+
 ## Install
 
 ```bash

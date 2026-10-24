@@ -3,19 +3,28 @@ set -o pipefail
 
 usage() {
     cat <<'EOF'
-Usage: hm [-c|--clean]
+Usage: hm [-c|--clean] [--notify-test]
 
 Options:
-  -c, --clean   strip the #UH# prefix from Server entries without removing actual uncommented mirrors
-  -h, --help    show this help message
+  -c, --clean     strip the #UH# prefix from Server entries without removing actual uncommented mirrors
+  --notify-test   send a test desktop notification and exit
+  -h, --help      show this help message
+
+Environment:
+  HM_NOTIFY=auto|always|never   desktop notifications on errors
+                                (default: auto = only when not run in a terminal)
 EOF
 }
 
 CLEAN=0
+NOTIFY_TEST=0
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c|--clean)
             CLEAN=1
+            ;;
+        --notify-test)
+            NOTIFY_TEST=1
             ;;
         -h|--help)
             usage
@@ -33,6 +42,89 @@ done
 CACHYOS_API='https://dashboard.cachyos.org/api/v1/mirrors'
 ARCH_API='https://archlinux.org/mirrors/status/json/'
 MARK='#UH#'
+NOTIFY_MODE="${HM_NOTIFY:-auto}"
+
+# ---------------------------------------------------------------------------
+# Desktop notifications (errors only, and only when not run in a terminal).
+# Failures of the notification itself are reported on stderr (-> journal).
+# ---------------------------------------------------------------------------
+want_notify() {
+    case "$NOTIFY_MODE" in
+        always) return 0 ;;
+        never)  return 1 ;;
+        *)      [[ ! -t 1 && ! -t 2 ]] ;;
+    esac
+}
+
+desktop_notify() {
+    local title="$1" body="$2" out tool
+    want_notify || return 0
+    if ! command -v notify-send >/dev/null 2>&1; then
+        printf 'hm: notify-send not found, desktop notification skipped\n' >&2
+        return 0
+    fi
+
+    # regular user (e.g. started from a keybinding): talk to own session bus
+    if [[ "$EUID" -ne 0 ]]; then
+        out=$(timeout 5 notify-send -a hm -u critical -i dialog-warning "$title" "$body" 2>&1) \
+            || printf 'hm: desktop notification failed: %s\n' "$out" >&2
+        return 0
+    fi
+
+    # root (e.g. started by hm-daemon): notify every active user session once
+    for tool in loginctl setpriv; do
+        command -v "$tool" >/dev/null 2>&1 || {
+            printf 'hm: %s not found, desktop notification skipped\n' "$tool" >&2
+            return 0
+        }
+    done
+    local sid k v active uid gid sent=0
+    local -A notified=()
+    while read -r sid _; do
+        [[ -n "$sid" ]] || continue
+        active='' uid=''
+        while IFS== read -r k v; do
+            case "$k" in
+                Active) active="$v" ;;
+                User)   uid="$v" ;;
+            esac
+        done < <(loginctl show-session "$sid" -p Active -p User 2>/dev/null)
+        [[ "$active" == yes && "$uid" =~ ^[0-9]+$ && "$uid" -ne 0 ]] || continue
+        [[ -z "${notified[$uid]:-}" ]] || continue
+        notified[$uid]=1
+        gid=$(id -g "$uid" 2>/dev/null) || {
+            printf 'hm: cannot resolve gid of uid %s\n' "$uid" >&2
+            continue
+        }
+        # Note: /run/user/$uid is mode 0700, so root without CAP_DAC_OVERRIDE
+        # (as in hm-daemon's sandbox) cannot even stat the bus socket; do not
+        # test for it here, just try and report the result.
+        if out=$(timeout 5 setpriv --reuid="$uid" --regid="$gid" --clear-groups \
+                    env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                        XDG_RUNTIME_DIR="/run/user/$uid" \
+                    notify-send -a hm -u critical -i dialog-warning "$title" "$body" 2>&1); then
+            sent=$((sent + 1))
+            printf 'hm: notified uid %s\n' "$uid" >&2
+        else
+            printf 'hm: notification to uid %s failed: %s\n' "$uid" "$out" >&2
+        fi
+    done < <(loginctl list-sessions --no-legend 2>/dev/null)
+    [[ "$sent" -gt 0 ]] || printf 'hm: no active user session reached, desktop notification not delivered\n' >&2
+    return 0
+}
+
+die() {
+    printf 'hm: %s\n' "$*" >&2
+    desktop_notify "hm: mirror check failed" "$*"
+    exit 1
+}
+
+if [[ "$NOTIFY_TEST" -eq 1 ]]; then
+    NOTIFY_MODE=always
+    desktop_notify "hm: test notification" "If you can see this, error notifications work."
+    echo "Test notification sent (if nothing appeared, check notify-send, a notification daemon and an active session)."
+    exit 0
+fi
 
 mapfile -t MIRRORLISTS < <(
     grep '^Include' /etc/pacman.conf |
@@ -63,7 +155,7 @@ if [[ "$CLEAN" -eq 1 ]]; then
     for mirrorlist in "${MIRRORLISTS[@]}"; do
         [[ -f "$mirrorlist" ]] || continue
         candidate=$(mktemp)
-        sed "s/^${MARK}//" "$mirrorlist" > "$candidate" || exit 1
+        sed "s/^${MARK}//" "$mirrorlist" > "$candidate" || die "failed to process $mirrorlist"
         if ! cmp -s "$mirrorlist" "$candidate"; then
             changed=1
             CLEAN_TARGETS+=("$mirrorlist")
@@ -75,7 +167,7 @@ if [[ "$CLEAN" -eq 1 ]]; then
 
     if [[ "$changed" -eq 1 ]]; then
         if [[ "$EUID" -ne 0 ]]; then
-            sudo -v || exit 1
+            sudo -v || die "sudo authentication failed"
         fi
         for i in "${!CLEAN_TARGETS[@]}"; do
             if [[ "$EUID" -eq 0 ]]; then
@@ -83,7 +175,7 @@ if [[ "$CLEAN" -eq 1 ]]; then
             else
                 sudo cp "${CLEAN_CANDIDATES[$i]}" "${CLEAN_TARGETS[$i]}"
             fi
-            rm -f "${CLEAN_CANDIDATES[$i]}" || exit 1
+            rm -f "${CLEAN_CANDIDATES[$i]}" || die "failed to remove temporary file"
         done
     fi
     exit 0
@@ -99,7 +191,8 @@ SED=$(mktemp)
 trap 'rm -f "$JSON_CACHYOS" "$JSON_ARCH" "$ARCH_MIRRORS" "$TMP" "$TMP_V3" "$TMP_V4" "$SED" "${CANDIDATES[@]}"' EXIT
 
 # Get architecture-specific CachyOS mirror status
-curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" > "$JSON_CACHYOS" || exit 1
+curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" > "$JSON_CACHYOS" \
+    || die "cannot download CachyOS mirror status"
 for architecture in x86_64 x86_64_v3 x86_64_v4; do
     output="$TMP"
     [[ "$architecture" == x86_64_v3 ]] && output="$TMP_V3"
@@ -113,11 +206,13 @@ for architecture in x86_64 x86_64_v3 x86_64_v4; do
           ] as $checks
         | select($checks | length > 0 and all(. == "synced"))
         | .url
-    ' "$JSON_CACHYOS" | sed 's:/$::' > "$output" || exit 1
+    ' "$JSON_CACHYOS" | sed 's:/$::' > "$output" \
+        || die "cannot parse CachyOS mirror status ($architecture)"
 done
 
 # Get healthy Arch mirrors
-curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" > "$JSON_ARCH" || exit 1
+curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" > "$JSON_ARCH" \
+    || die "cannot download Arch Linux mirror status"
 jq -r '
   .urls[]
   | select(
@@ -129,12 +224,13 @@ jq -r '
     )
   | .url
 ' "$JSON_ARCH" |
-sed 's:/$::' > "$ARCH_MIRRORS" || exit 1
+sed 's:/$::' > "$ARCH_MIRRORS" || die "cannot parse Arch Linux mirror status"
 
 #jq -r '.urls[] | select(.protocol == "https" and .active == true and .completion_pct == 1.0 and .delay <= 3600) | .url' "$JSON_ARCH" |
 #    sed 's:/$::' 
 
 SUMMARY=''
+SUMMARY_PLAIN=''
 first=1
 zero_active=0
 changed=0
@@ -158,10 +254,10 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     while read -r url; do
         printf 's|^%sServer = %s/|Server = %s/|\n' \
             "$MARK" "$url" "$url"
-    done < "$healthy" >> "$SED" || exit 1
+    done < "$healthy" >> "$SED" || die "cannot build mirror filter"
 
     candidate=$(mktemp)
-    sed -f "$SED" "$mirrorlist" > "$candidate" || exit 1
+    sed -f "$SED" "$mirrorlist" > "$candidate" || die "failed to process $mirrorlist"
 
     commented_count=$(grep -c "^${MARK}Server = " "$candidate" || true)
     active_count=$(grep -c "^Server = " "$candidate" || true)
@@ -179,16 +275,17 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     [[ "$name" == "mirrorlist" ]] && name="arch"
     name="${name%-mirrorlist}"
 
-    [[ "$first" -eq 1 ]] || SUMMARY+=' | '
+    [[ "$first" -eq 1 ]] || { SUMMARY+=' | '; SUMMARY_PLAIN+=' | '; }
     SUMMARY+=$(printf '%s (%s%s%s/%s%s%s)' \
         "$name" "$GREEN" "$active_count" "$RESET" \
         "$RED" "$commented_count" "$RESET")
+    SUMMARY_PLAIN+=$(printf '%s (%s/%s)' "$name" "$active_count" "$commented_count")
     first=0
 done
 
 if [[ "$changed" -eq 1 ]]; then
     if [[ "$EUID" -ne 0 ]]; then
-        sudo -v || exit 1
+        sudo -v || die "sudo authentication failed"
     fi
     for i in "${!TARGETS[@]}"; do
         if [[ "$EUID" -eq 0 ]]; then
@@ -204,5 +301,7 @@ printf "==== mirror summary (${GREEN}on${RESET}/${RED}off${RESET}): %s ====\n" "
 if [[ "$zero_active" -eq 1 ]]; then
     printf '%sWARNING:%s no active mirrors available in at least one repo; try again later.\n' \
         "$WARNING_STYLE" "$RESET"
+    desktop_notify "hm: no active mirrors" \
+        "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. Try again later."
     exit 1
 fi
