@@ -4,7 +4,8 @@ import ctypes, os, re, select, signal, struct, subprocess, sys, time
 
 HM = os.environ.get("HM", "/usr/local/bin/hm")
 HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "30"))
-COOLDOWN = float(os.environ.get("COOLDOWN", "60"))   # min. seconds between hm runs
+COOLDOWN = float(os.environ.get("COOLDOWN", "60"))     # min. seconds between hm runs
+RECHECK = float(os.environ.get("RECHECK", "60"))        # seconds between checks whether a watched file was replaced
 WATCH = os.environ.get("WATCH", "/etc/pacman.conf").split(":")
 # always trigger (e.g. a program that only ever syncs/downloads)
 SHELLY_RE = re.compile(os.environ.get("SHELLY_RE", r"shelly.*"), re.I)
@@ -13,6 +14,7 @@ HELPERS_RE = re.compile(os.environ.get("HELPERS_RE", r"yay|paru|pikaur|trizen|oc
 
 FAN_CLOEXEC, FAN_CLASS_CONTENT = 0x1, 0x4
 FAN_OPEN_PERM, FAN_MARK_ADD, FAN_ALLOW = 0x10000, 0x1, 1
+FANOTIFY_METADATA_VERSION = 3
 AT_FDCWD = -100
 EVT = struct.Struct("=IBBHQii")   # event_len, vers, reserved, metadata_len, mask, fd, pid
 RESP = struct.Struct("=iI")       # fd, response
@@ -36,10 +38,14 @@ def is_descendant(pid, root):
         pid = ppid_of(pid)
     return False
 
+def printable(s):
+    """Replace non-printable characters so that process data cannot forge log lines."""
+    return "".join(c if c.isprintable() else "?" for c in s)
+
 def proc_info(pid):
     try:
         with open(f"/proc/{pid}/comm") as f:
-            comm = f.read().strip()
+            comm = printable(f.read().strip())
         with open(f"/proc/{pid}/cmdline", "rb") as f:
             args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
         return comm, args
@@ -47,39 +53,60 @@ def proc_info(pid):
         return "?", []
 
 def sync_ops(opts):
-    """True if the option list contains a sync (-S*) or upgrade (-U) operation."""
+    """True if the option list contains an operation that downloads from mirrors."""
     for a in opts:
         if a in ("--sync", "--upgrade"):
             return True
         if not a.startswith("--") and re.search(r"[SU]", a):
             return True
-    return False
+        if not a.startswith("--") and "F" in a and "y" in a:      # pacman -Fy: refresh file databases
+            return True
+    return "--files" in opts and "--refresh" in opts
 
 def should_trigger(comm, args):
     opts = [a for a in args[1:] if a.startswith("-")]
     if comm == "pacman":
-        # only operations that use mirrors: -S* and -U (not -Q, -T, -V, ...)
+        # only operations that use mirrors: -S*, -U, -Fy (not -Q, -T, -V, ...)
         return sync_ops(opts)
     if HELPERS_RE.fullmatch(comm):
         # no options = interactive search/install by name; otherwise only sync/upgrade
         return not opts or sync_ops(opts)
     return bool(SHELLY_RE.fullmatch(comm))
 
+def file_id(path):
+    try:
+        st = os.stat(path)
+        return (st.st_dev, st.st_ino)
+    except OSError:
+        return None
+
+def add_mark(fan, path):
+    """Returns 0 on success, errno on failure."""
+    if libc.fanotify_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, path.encode()) < 0:
+        return ctypes.get_errno()
+    return 0
+
 def main():
     fan = libc.fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, os.O_RDONLY)
     if fan < 0:
         sys.exit(f"fanotify_init: {os.strerror(ctypes.get_errno())}")
+    marked = {}
     for path in WATCH:
-        if libc.fanotify_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, path.encode()) < 0:
-            sys.exit(f"fanotify_mark({path}): {os.strerror(ctypes.get_errno())}")
+        err = add_mark(fan, path)
+        if err:
+            sys.exit(f"fanotify_mark({path}): {os.strerror(err)}")
+        marked[path] = file_id(path)
     print(f"watching open() on: {WATCH}", flush=True)
 
     held, hm, t0, last = [], None, 0.0, 0.0
+    next_check = time.time() + RECHECK
     me = os.getpid()
 
     def allow(fd):
         try:
             os.write(fan, RESP.pack(fd, FAN_ALLOW))
+        except OSError as e:
+            print(f"allow(fd={fd}) failed: {e}", flush=True)
         finally:
             os.close(fd)
 
@@ -90,13 +117,30 @@ def main():
             allow(fd)
         held, hm, last = [], None, time.time()
 
+    def recheck():
+        """A watched file replaced by rename has a new inode, so the old mark no longer applies."""
+        for path in WATCH:
+            fid = file_id(path)
+            if fid is None or fid == marked.get(path):
+                continue
+            err = add_mark(fan, path)
+            if err:
+                print(f"re-marking {path} failed: {os.strerror(err)}", flush=True)
+            else:
+                marked[path] = fid
+                print(f"{path} was replaced, re-marked", flush=True)
+
     while True:
-        r, _, _ = select.select([fan], [], [], 0.2 if hm else None)
+        r, _, _ = select.select([fan], [], [], 0.2 if hm else RECHECK)
         if r:
             buf = os.read(fan, 65536)
             off = 0
             while off + EVT.size <= len(buf):
-                ln, _, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
+                ln, vers, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
+                if vers != FANOTIFY_METADATA_VERSION:
+                    sys.exit(f"unsupported fanotify metadata version: {vers}")
+                if ln < EVT.size:
+                    break
                 off += ln
                 if fd < 0:
                     continue
@@ -111,10 +155,16 @@ def main():
                     print(f"open pid={pid} comm={comm} cmd={' '.join(args)[:100]!r} "
                           f"trigger={ok} cooldown={cool}", flush=True)
                     if ok and not cool:
-                        hm = subprocess.Popen([HM], start_new_session=True)
-                        t0 = time.time()
-                        held.append(fd)
-                        print(f"started {HM} (pid {hm.pid})", flush=True)
+                        try:
+                            hm = subprocess.Popen([HM], start_new_session=True)
+                        except OSError as e:
+                            print(f"cannot start {HM}: {e}", flush=True)
+                            last = time.time()       # do not retry on every open
+                            allow(fd)
+                        else:
+                            t0 = time.time()
+                            held.append(fd)
+                            print(f"started {HM} (pid {hm.pid})", flush=True)
                     else:
                         allow(fd)
         if hm:
@@ -128,6 +178,9 @@ def main():
                     pass
                 hm.wait()
                 release("hm timed out")
+        elif time.time() >= next_check:
+            recheck()
+            next_check = time.time() + RECHECK
 
 if __name__ == "__main__":
     main()

@@ -4,13 +4,15 @@ Checks mirror health and automatically keeps only healthy mirrors active, reduci
 
 ## What it does
 
-The `hm` script reads the mirror lists included via `/etc/pacman.conf` and checks the current CachyOS and Arch Linux mirror status using their respective APIs.
+The `hm` script reads existing mirror-list files included via `/etc/pacman.conf` (including ordinary shell-glob patterns) and checks the current CachyOS and Arch Linux mirror status using their respective APIs. Non-absolute or missing `Include` entries are skipped; if no existing mirror-list file is found, the script fails.
 
 For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
 
 For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour.
 
-The script updates the mirrorlist files **in place, without creating a backup**, by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to undo the markers.
+The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
+
+Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror. API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. If `hm` is killed in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
 
 After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list. If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
 
@@ -20,7 +22,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 **What triggers `hm`**
 
-- `pacman` with a sync or upgrade operation (`-S*`, `-U`). Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
+- `pacman` with a mirror-using operation: sync or upgrade (`-S*`, `-U`), or file-database refresh (`-Fy` / `--files --refresh`). Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
 - Processes whose name matches `SHELLY_RE` (default: `shelly.*`).
 - AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation.
 
@@ -30,6 +32,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly.
 - `hm` is killed if it runs longer than the timeout (default 30 s).
+- If a watched file is replaced (for example by an editor or a package update), the daemon re-marks the new inode within `RECHECK` seconds.
 
 - **If `hm` fails or times out, the waiting program is still released and continues with the existing mirror lists.**
 - If the daemon stops, the kernel releases all held requests, so `pacman` cannot hang permanently.
@@ -60,12 +63,12 @@ Environment="HELPERS_RE=yay|paru"
 | `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated) |
 | `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` |
 | `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation |
-
+| `RECHECK` | `60` | Seconds between checks whether a watched file was replaced (new inode) and needs to be monitored again |
 ## Requirements
 
 `hm`:
 
-- `bash`, `curl`, `jq`, `sed`, `grep`, `cmp` (diffutils)
+- `bash`, `curl`, `jq`, `sed`, `grep`, `cmp`, `awk`, `mktemp`, `mv`, `cp`, `timeout`
 - `sudo` (only when mirrorlist files need to be updated and you are not root)
 
 `hm-daemon` (optional):
@@ -92,7 +95,7 @@ cd healthy-mirrors
 ./install-daemon.sh   # optional: installs and starts hm-daemon.service
 ```
 
-`install-daemon.sh` requires `hm` to be already installed in `/usr/local/bin`. It can be run again to update the service.
+Both installers use only files from the local checkout; they never download executable files. `install-daemon.sh` requires `hm` to be already installed in `/usr/local/bin`, validates the local daemon source as Python, and checks that `hm` and every path component up to `/` are root-owned and not group/world-writable. It can be run again to update the service. Use `SRC=/path/to/hm-daemon ./install-daemon.sh` to install a daemon from another local path.
 
 ## Update
 
@@ -103,7 +106,8 @@ git pull --ff-only
 ./install-daemon.sh   # optional: updates and restarts hm-daemon.service
 ```
 
-- `install-daemon.sh` can be run repeatedly. It replaces `/usr/local/bin/hm-daemon`, regenerates the service unit and restarts the service.
+- `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755`.
+- `install-daemon.sh` can be run repeatedly. It replaces `/usr/local/bin/hm-daemon`, regenerates the service unit using the resolved `Include` directories as writable paths, and restarts the service.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`) are kept.
 

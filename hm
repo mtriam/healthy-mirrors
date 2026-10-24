@@ -1,4 +1,4 @@
-#!/bin/bash
+#!/usr/bin/env bash
 set -o pipefail
 
 usage() {
@@ -6,7 +6,7 @@ usage() {
 Usage: hm [-c|--clean] [--notify-test]
 
 Options:
-  -c, --clean     strip the #UH# prefix from Server entries without removing actual uncommented mirrors
+  -c, --clean     strip the #UH# prefix from Server entries
   --notify-test   send a test desktop notification and exit
   -h, --help      show this help message
 
@@ -18,20 +18,14 @@ EOF
 
 CLEAN=0
 NOTIFY_TEST=0
+
 while [[ $# -gt 0 ]]; do
     case "$1" in
-        -c|--clean)
-            CLEAN=1
-            ;;
-        --notify-test)
-            NOTIFY_TEST=1
-            ;;
-        -h|--help)
-            usage
-            exit 0
-            ;;
+        -c|--clean)    CLEAN=1 ;;
+        --notify-test) NOTIFY_TEST=1 ;;
+        -h|--help)     usage; exit 0 ;;
         *)
-            echo "Unknown option: $1" >&2
+            printf 'hm: unknown option: %s\n' "$1" >&2
             usage >&2
             exit 1
             ;;
@@ -45,9 +39,33 @@ MARK='#UH#'
 NOTIFY_MODE="${HM_NOTIFY:-auto}"
 
 # ---------------------------------------------------------------------------
-# Desktop notifications (errors only, and only when not run in a terminal).
-# Failures of the notification itself are reported on stderr (-> journal).
+# Temporary files
 # ---------------------------------------------------------------------------
+
+declare -a TEMPFILES=()
+declare -a TARGETS=()
+declare -a CANDIDATES=()
+
+NEW_TEMP_PATH=''
+
+new_temp() {
+    NEW_TEMP_PATH=$(mktemp) || return 1
+    TEMPFILES+=("$NEW_TEMP_PATH")
+}
+
+cleanup_temp() {
+    local path
+    for path in "${TEMPFILES[@]}"; do
+        [[ -n "$path" ]] && rm -f -- "$path"
+    done
+}
+
+trap cleanup_temp EXIT
+
+# ---------------------------------------------------------------------------
+# Notifications (errors only; failures of the notification itself go to stderr)
+# ---------------------------------------------------------------------------
+
 want_notify() {
     case "$NOTIFY_MODE" in
         always) return 0 ;;
@@ -58,141 +76,420 @@ want_notify() {
 
 desktop_notify() {
     local title="$1" body="$2" out tool
-    want_notify || return 0
-    if ! command -v notify-send >/dev/null 2>&1; then
-        printf 'hm: notify-send not found, desktop notification skipped\n' >&2
-        return 0
-    fi
-
-    # regular user (e.g. started from a keybinding): talk to own session bus
-    if [[ "$EUID" -ne 0 ]]; then
-        out=$(timeout 5 notify-send -a hm -u critical -i dialog-warning "$title" "$body" 2>&1) \
-            || printf 'hm: desktop notification failed: %s\n' "$out" >&2
-        return 0
-    fi
-
-    # root (e.g. started by hm-daemon): notify every active user session once
-    for tool in loginctl setpriv; do
-        command -v "$tool" >/dev/null 2>&1 || {
-            printf 'hm: %s not found, desktop notification skipped\n' "$tool" >&2
-            return 0
-        }
-    done
     local sid k v active uid gid sent=0
     local -A notified=()
+
+    want_notify || return 0
+
+    if ! command -v notify-send >/dev/null 2>&1; then
+        printf 'hm: notify-send not found; notification skipped\n' >&2
+        return 0
+    fi
+
+    if [[ "$EUID" -ne 0 ]]; then
+        if ! out=$(timeout 5 notify-send -a hm -u critical \
+                -i dialog-warning "$title" "$body" 2>&1); then
+            printf 'hm: notification failed: %s\n' "$out" >&2
+        fi
+        return 0
+    fi
+
+    for tool in loginctl setpriv timeout; do
+        if ! command -v "$tool" >/dev/null 2>&1; then
+            printf 'hm: %s not found; notification skipped\n' "$tool" >&2
+            return 0
+        fi
+    done
+
     while read -r sid _; do
         [[ -n "$sid" ]] || continue
-        active='' uid=''
-        while IFS== read -r k v; do
+
+        active=''
+        uid=''
+
+        while IFS='=' read -r k v; do
             case "$k" in
                 Active) active="$v" ;;
                 User)   uid="$v" ;;
             esac
         done < <(loginctl show-session "$sid" -p Active -p User 2>/dev/null)
+
         [[ "$active" == yes && "$uid" =~ ^[0-9]+$ && "$uid" -ne 0 ]] || continue
         [[ -z "${notified[$uid]:-}" ]] || continue
         notified[$uid]=1
+
         gid=$(id -g "$uid" 2>/dev/null) || {
             printf 'hm: cannot resolve gid of uid %s\n' "$uid" >&2
             continue
         }
-        # Note: /run/user/$uid is mode 0700, so root without CAP_DAC_OVERRIDE
-        # (as in hm-daemon's sandbox) cannot even stat the bus socket; do not
-        # test for it here, just try and report the result.
-        if out=$(timeout 5 setpriv --reuid="$uid" --regid="$gid" --clear-groups \
-                    env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
-                        XDG_RUNTIME_DIR="/run/user/$uid" \
-                    notify-send -a hm -u critical -i dialog-warning "$title" "$body" 2>&1); then
+
+        if out=$(timeout 5 setpriv --reuid="$uid" --regid="$gid" \
+                --clear-groups \
+                env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
+                    XDG_RUNTIME_DIR="/run/user/$uid" \
+                notify-send -a hm -u critical -i dialog-warning \
+                    "$title" "$body" 2>&1); then
             sent=$((sent + 1))
             printf 'hm: notified uid %s\n' "$uid" >&2
         else
             printf 'hm: notification to uid %s failed: %s\n' "$uid" "$out" >&2
         fi
     done < <(loginctl list-sessions --no-legend 2>/dev/null)
-    [[ "$sent" -gt 0 ]] || printf 'hm: no active user session reached, desktop notification not delivered\n' >&2
+
+    [[ "$sent" -gt 0 ]] ||
+        printf 'hm: no active user session reached; notification not delivered\n' >&2
+
     return 0
 }
 
 die() {
     printf 'hm: %s\n' "$*" >&2
-    desktop_notify "hm: mirror check failed" "$*"
+    desktop_notify 'hm: mirror check failed' "$*"
     exit 1
 }
 
 if [[ "$NOTIFY_TEST" -eq 1 ]]; then
     NOTIFY_MODE=always
-    desktop_notify "hm: test notification" "If you can see this, error notifications work."
-    echo "Test notification sent (if nothing appeared, check notify-send, a notification daemon and an active session)."
+    desktop_notify 'hm: test notification' \
+        'If you can see this, error notifications work.'
+    printf 'Test notification attempted.\n'
     exit 0
 fi
 
-mapfile -t MIRRORLISTS < <(
-    grep '^Include' /etc/pacman.conf |
-        sed 's/[[:space:]]*$//' |
-        sort -u |
-        sed 's/^Include[[:space:]]*=[[:space:]]*//'
+# ---------------------------------------------------------------------------
+# Privileged operations
+# ---------------------------------------------------------------------------
+
+# Use elevated privileges only for operations that write/remove files
+# in system-owned mirrorlist directories.
+run_priv() {
+    if [[ "$EUID" -eq 0 ]]; then
+        "$@"
+    else
+        sudo "$@"
+    fi
+}
+
+# Invariant: toggling #UH# may change only the marker at the start of a line.
+# Normalize both files (drop one leading marker, ensure a final newline) and
+# compare them byte-for-byte.
+assert_invariant() {
+    local original="$1" candidate="$2"
+    local original_normalized candidate_normalized
+
+    original_normalized=$(mktemp) || return 1
+    candidate_normalized=$(mktemp) || {
+        rm -f -- "$original_normalized"
+        return 1
+    }
+
+    if ! sed -e 's/^#UH#//' -e '$a\' "$original" > "$original_normalized" ||
+       ! sed -e 's/^#UH#//' -e '$a\' "$candidate" > "$candidate_normalized" ||
+       ! cmp -s -- "$original_normalized" "$candidate_normalized"; then
+        rm -f -- "$original_normalized" "$candidate_normalized"
+        return 1
+    fi
+
+    rm -f -- "$original_normalized" "$candidate_normalized"
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Read pacman Include directives.
+# Expand ordinary shell globs and ignore missing optional files.
+# ---------------------------------------------------------------------------
+
+declare -a MIRRORLISTS=()
+declare -A SEEN_LISTS=()
+
+while IFS= read -r include; do
+    [[ -n "$include" ]] || continue
+
+    # pacman.conf paths are expected to be absolute in this use case.
+    if [[ "$include" != /* ]]; then
+        printf 'hm: skipping non-absolute Include path: %s\n' "$include" >&2
+        continue
+    fi
+
+    shopt -s nullglob
+    matches=( $include )
+    shopt -u nullglob
+
+    for mirrorlist in "${matches[@]}"; do
+        [[ -f "$mirrorlist" ]] || continue
+        [[ -z "${SEEN_LISTS[$mirrorlist]:-}" ]] || continue
+
+        SEEN_LISTS[$mirrorlist]=1
+        MIRRORLISTS+=("$mirrorlist")
+    done
+done < <(
+    awk '
+        /^[[:space:]]*#/ { next }
+        /^[[:space:]]*Include[[:space:]]*=/ {
+            sub(/^[[:space:]]*Include[[:space:]]*=[[:space:]]*/, "")
+            sub(/[[:space:]]*#.*/, "")
+            sub(/[[:space:]]*$/, "")
+            if ($0 != "") print
+        }
+    ' /etc/pacman.conf
 )
 
+if [[ "${#MIRRORLISTS[@]}" -eq 0 ]]; then
+    die 'no existing mirrorlist files found in /etc/pacman.conf'
+fi
 
-# Detect terminal color support
-if [[ -t 1 ]] && [[ "${TERM:-}" != "dumb" ]] && [[ -z "${NO_COLOR:-}" ]]; then
+# ---------------------------------------------------------------------------
+# Colors
+# ---------------------------------------------------------------------------
+
+if [[ -t 1 && "${TERM:-}" != dumb && -z "${NO_COLOR:-}" ]]; then
     GREEN=$'\033[38;5;46m'
     RED=$'\033[38;5;196m'
-    WARNING_STYLE="${RED}"
     RESET=$'\033[0m'
 else
     GREEN=''
     RED=''
-    WARNING_STYLE="${RED}"
     RESET=''
 fi
 
-# Remove only the marker prefix from previously flagged mirrors
-if [[ "$CLEAN" -eq 1 ]]; then
-    changed=0
-    declare -a CLEAN_TARGETS=()
-    declare -a CLEAN_CANDIDATES=()
-    for mirrorlist in "${MIRRORLISTS[@]}"; do
-        [[ -f "$mirrorlist" ]] || continue
-        candidate=$(mktemp)
-        sed "s/^${MARK}//" "$mirrorlist" > "$candidate" || die "failed to process $mirrorlist"
-        if ! cmp -s "$mirrorlist" "$candidate"; then
-            changed=1
-            CLEAN_TARGETS+=("$mirrorlist")
-            CLEAN_CANDIDATES+=("$candidate")
+WARNING_STYLE="$RED"
+
+# ---------------------------------------------------------------------------
+# Transactional replacement
+#
+# Prepare every staged file and backup before replacing any target.
+# Each individual rename is atomic. If a later rename fails, roll back
+# previously committed files. Backups are created alongside their targets.
+# ---------------------------------------------------------------------------
+
+transactional_commit() {
+    local count="${#TARGETS[@]}"
+    local i target candidate dir stage backup
+    local committed=0 rollback_failed=0
+
+    [[ "$count" -eq "${#CANDIDATES[@]}" ]] || {
+        printf 'hm: internal error: target/candidate count mismatch\n' >&2
+        return 1
+    }
+
+    [[ "$count" -gt 0 ]] || return 0
+
+    # Authenticate once, before touching any system files. Subsequent
+    # run_priv calls reuse sudo's timestamp until it expires.
+    if [[ "$EUID" -ne 0 ]]; then
+        sudo -v || {
+            printf 'hm: sudo authentication failed\n' >&2
+            return 1
+        }
+    fi
+
+    local -a STAGES=()
+    local -a BACKUPS=()
+
+    # Prepare every stage and backup before committing anything.
+    for i in "${!TARGETS[@]}"; do
+        target="${TARGETS[$i]}"
+        candidate="${CANDIDATES[$i]}"
+        dir="${target%/*}"
+
+        [[ -f "$target" && -f "$candidate" ]] || {
+            printf 'hm: target or candidate disappeared: %s\n' "$target" >&2
+            rollback_failed=1
+            break
+        }
+
+        stage=$(run_priv mktemp "$dir/.hm-stage.XXXXXX") || {
+            printf 'hm: cannot create staging file for %s\n' "$target" >&2
+            rollback_failed=1
+            break
+        }
+
+        backup=$(run_priv mktemp "$dir/.hm-backup.XXXXXX") || {
+            run_priv rm -f -- "$stage"
+            printf 'hm: cannot create backup for %s\n' "$target" >&2
+            rollback_failed=1
+            break
+        }
+
+        STAGES+=("$stage")
+        BACKUPS+=("$backup")
+
+        run_priv cp -a -- "$target" "$stage" &&
+            run_priv cp -a -- "$target" "$backup" &&
+            run_priv bash -c 'cat -- "$1" > "$2"' _ "$candidate" "$stage" || {
+                printf 'hm: cannot prepare replacement for %s\n' "$target" >&2
+                rollback_failed=1
+                break
+            }
+    done
+
+    if [[ "$rollback_failed" -ne 0 ]]; then
+        for stage in "${STAGES[@]}"; do
+            run_priv rm -f -- "$stage" || true
+        done
+        for backup in "${BACKUPS[@]}"; do
+            run_priv rm -f -- "$backup" || true
+        done
+        return 1
+    fi
+
+    # Commit staged files one by one.
+    for i in "${!TARGETS[@]}"; do
+        target="${TARGETS[$i]}"
+        stage="${STAGES[$i]}"
+
+        # Detect changes to the original after staging.
+        if ! run_priv cmp -s -- "${BACKUPS[$i]}" "$target"; then
+            printf 'hm: target changed during preparation: %s\n' "$target" >&2
+            rollback_failed=1
+            break
+        fi
+
+        if run_priv mv -f -- "$stage" "$target"; then
+            committed=$((committed + 1))
         else
-            rm -f "$candidate"
+            printf 'hm: cannot replace %s\n' "$target" >&2
+            rollback_failed=1
+            break
         fi
     done
 
-    if [[ "$changed" -eq 1 ]]; then
-        if [[ "$EUID" -ne 0 ]]; then
-            sudo -v || die "sudo authentication failed"
-        fi
-        for i in "${!CLEAN_TARGETS[@]}"; do
-            if [[ "$EUID" -eq 0 ]]; then
-                cp "${CLEAN_CANDIDATES[$i]}" "${CLEAN_TARGETS[$i]}"
-            else
-                sudo cp "${CLEAN_CANDIDATES[$i]}" "${CLEAN_TARGETS[$i]}"
+    if [[ "$rollback_failed" -ne 0 ]]; then
+        # Restore only files already replaced. Keep backups if restoration fails.
+        for ((i = committed - 1; i >= 0; i--)); do
+            target="${TARGETS[$i]}"
+            backup="${BACKUPS[$i]}"
+
+            if ! run_priv mv -f -- "$backup" "$target"; then
+                printf 'hm: CRITICAL: rollback failed for %s\n' "$target" >&2
+                printf 'hm: backup retained at %s\n' "$backup" >&2
+                rollback_failed=2
             fi
-            rm -f "${CLEAN_CANDIDATES[$i]}" || die "failed to remove temporary file"
         done
+
+        for i in "${!STAGES[@]}"; do
+            run_priv rm -f -- "${STAGES[$i]}" || true
+        done
+
+        # Do not remove backups whose restoration failed.
+        for i in "${!BACKUPS[@]}"; do
+            if [[ "$rollback_failed" -ne 2 || "$i" -ge "$committed" ]]; then
+                run_priv rm -f -- "${BACKUPS[$i]}" || true
+            fi
+        done
+
+        if [[ "$rollback_failed" -eq 2 ]]; then
+            printf 'hm: manual recovery may be required\n' >&2
+        fi
+        return 1
     fi
+
+    for backup in "${BACKUPS[@]}"; do
+        run_priv rm -f -- "$backup" || {
+            printf 'hm: warning: could not remove backup %s\n' "$backup" >&2
+        }
+    done
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Clean mode
+# ---------------------------------------------------------------------------
+
+if [[ "$CLEAN" -eq 1 ]]; then
+    for mirrorlist in "${MIRRORLISTS[@]}"; do
+        new_temp || die 'cannot create temporary file'
+        candidate=$NEW_TEMP_PATH
+
+        awk '
+            /^#UH#Server = / {
+                sub(/^#UH#/, "")
+            }
+            { print }
+        ' "$mirrorlist" > "$candidate" ||
+            die "failed to process $mirrorlist"
+
+        assert_invariant "$mirrorlist" "$candidate" ||
+            die "invariant check failed for $mirrorlist; no changes committed"
+
+        if ! cmp -s -- "$mirrorlist" "$candidate"; then
+            TARGETS+=("$mirrorlist")
+            CANDIDATES+=("$candidate")
+        fi
+    done
+
+    if [[ "${#TARGETS[@]}" -gt 0 ]]; then
+        transactional_commit ||
+            die 'clean operation failed; check the errors above'
+    fi
+
     exit 0
 fi
 
-JSON_CACHYOS=$(mktemp)
-JSON_ARCH=$(mktemp)
-ARCH_MIRRORS=$(mktemp)
-TMP=$(mktemp)
-TMP_V3=$(mktemp)
-TMP_V4=$(mktemp)
-SED=$(mktemp)
-trap 'rm -f "$JSON_CACHYOS" "$JSON_ARCH" "$ARCH_MIRRORS" "$TMP" "$TMP_V3" "$TMP_V4" "$SED" "${CANDIDATES[@]}"' EXIT
+# ---------------------------------------------------------------------------
+# API downloads and validation
+# Malformed single entries are skipped by the jq filters; the response as a
+# whole must contain at least one usable entry.
+# ---------------------------------------------------------------------------
 
-# Get architecture-specific CachyOS mirror status
-curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" > "$JSON_CACHYOS" \
-    || die "cannot download CachyOS mirror status"
+new_temp || die 'cannot create temporary file'
+JSON_CACHYOS=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+JSON_ARCH=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+TMP=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+TMP_V3=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+TMP_V4=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+ARCH_MIRRORS=$NEW_TEMP_PATH
+
+curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" -o "$JSON_CACHYOS" ||
+    die 'cannot download CachyOS mirror status'
+
+jq -e '
+    (.mirrors | type == "array")
+    and ([ .mirrors[]
+           | select((.url | type == "string") and (.checks | type == "array"))
+         ] | length) > 0
+' "$JSON_CACHYOS" >/dev/null ||
+    die 'invalid or incomplete CachyOS API response'
+
+curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" ||
+    die 'cannot download Arch Linux mirror status'
+
+jq -e '
+    (.urls | type == "array")
+    and ([ .urls[]
+           | select((.url | type == "string") and .protocol == "https")
+         ] | length) > 0
+' "$JSON_ARCH" >/dev/null ||
+    die 'invalid or incomplete Arch Linux API response'
+
+# Validate URLs without treating data as sed/regex syntax.
+validate_urls() {
+    local file="$1" url
+
+    while IFS= read -r url || [[ -n "$url" ]]; do
+        [[ -n "$url" ]] || continue
+
+        [[ "$url" == https://* ]] || return 1
+        [[ "$url" != *[[:space:]]* ]] || return 1
+        [[ "$url" != *'|'* && "$url" != *'\'* ]] || return 1
+        [[ "$url" != *$'\r'* && "$url" != *$'\n'* ]] || return 1
+    done < "$file"
+
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# CachyOS health lists
+# An empty list is not an error here: it only matters if a mirrorlist that
+# uses it would end up without active servers (handled by zero_active below).
+# ---------------------------------------------------------------------------
+
 for architecture in x86_64 x86_64_v3 x86_64_v4; do
     output="$TMP"
     [[ "$architecture" == x86_64_v3 ]] && output="$TMP_V3"
@@ -200,45 +497,58 @@ for architecture in x86_64 x86_64_v3 x86_64_v4; do
 
     jq -r --arg architecture "$architecture" '
         .mirrors[]
+        | select((.url | type == "string") and (.checks | type == "array"))
+        | select(.url | startswith("https://"))
         | [ .checks[]
-            | select(.path | startswith($architecture + "/"))
+            | select(
+                (.path | type == "string")
+                and (.path | startswith($architecture + "/"))
+            )
             | .status
           ] as $checks
-        | select($checks | length > 0 and all(. == "synced"))
+        | select(($checks | length) > 0 and all($checks[]; . == "synced"))
         | .url
-    ' "$JSON_CACHYOS" | sed 's:/$::' > "$output" \
-        || die "cannot parse CachyOS mirror status ($architecture)"
+        | sub("/+$"; "")
+    ' "$JSON_CACHYOS" > "$output" ||
+        die "cannot parse CachyOS mirror status ($architecture)"
+
+    validate_urls "$output" ||
+        die "invalid CachyOS URL ($architecture)"
 done
 
-# Get healthy Arch mirrors
-curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" > "$JSON_ARCH" \
-    || die "cannot download Arch Linux mirror status"
-jq -r '
-  .urls[]
-  | select(
-      .protocol == "https"
-      and .active == true
-      and .last_sync != null
-      and .completion_pct == 1.0
-      and .delay < 3600
-    )
-  | .url
-' "$JSON_ARCH" |
-sed 's:/$::' > "$ARCH_MIRRORS" || die "cannot parse Arch Linux mirror status"
+# ---------------------------------------------------------------------------
+# Arch Linux health list
+# ---------------------------------------------------------------------------
 
-#jq -r '.urls[] | select(.protocol == "https" and .active == true and .completion_pct == 1.0 and .delay <= 3600) | .url' "$JSON_ARCH" |
-#    sed 's:/$::' 
+jq -r '
+    .urls[]
+    | select(
+        (.url | type == "string")
+        and .protocol == "https"
+        and .active == true
+        and .last_sync != null
+        and .completion_pct == 1.0
+        and (.delay | type == "number")
+        and .delay < 3600
+    )
+    | .url
+    | sub("/+$"; "")
+' "$JSON_ARCH" > "$ARCH_MIRRORS" ||
+    die 'cannot parse Arch Linux mirror status'
+
+validate_urls "$ARCH_MIRRORS" ||
+    die 'invalid Arch Linux mirror URL'
+
+# ---------------------------------------------------------------------------
+# Build and validate all candidates before touching any mirrorlist.
+# ---------------------------------------------------------------------------
 
 SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
 zero_active=0
-changed=0
-declare -a TARGETS=()
-declare -a CANDIDATES=()
-for mirrorlist in "${MIRRORLISTS[@]}"; do
-    [[ -f "$mirrorlist" ]] || continue
 
+for mirrorlist in "${MIRRORLISTS[@]}"; do
     if [[ "${mirrorlist,,}" != *cachyos* ]]; then
         healthy="$ARCH_MIRRORS"
     elif [[ "${mirrorlist,,}" == *v4* ]]; then
@@ -249,59 +559,93 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
         healthy="$TMP"
     fi
 
-    # Remove old markers and mark all mirrors
-    printf 's/^%s//\n/^Server = /s/^/%s/\n' "$MARK" "$MARK" > "$SED"
-    while read -r url; do
-        printf 's|^%sServer = %s/|Server = %s/|\n' \
-            "$MARK" "$url" "$url"
-    done < "$healthy" >> "$SED" || die "cannot build mirror filter"
+    new_temp || die 'cannot create temporary file'
+    candidate=$NEW_TEMP_PATH
 
-    candidate=$(mktemp)
-    sed -f "$SED" "$mirrorlist" > "$candidate" || die "failed to process $mirrorlist"
+    # Match literal URL prefixes in Bash; API data is never executable syntax.
+    while IFS= read -r line || [[ -n "$line" ]]; do
+        if [[ "$line" == "$MARK"Server\ =\ * ]]; then
+            line="${line#"$MARK"}"
+        fi
 
+        if [[ "$line" == Server\ =\ * ]]; then
+            server="${line#Server = }"
+            healthy_match=0
+
+            while IFS= read -r url || [[ -n "$url" ]]; do
+                [[ -n "$url" ]] || continue
+
+                if [[ "$server" == "$url/"* || "$server" == "$url" ]]; then
+                    healthy_match=1
+                    break
+                fi
+            done < "$healthy"
+
+            if [[ "$healthy_match" -eq 1 ]]; then
+                printf '%s\n' "$line"
+            else
+                printf '%s%s\n' "$MARK" "$line"
+            fi
+        else
+            printf '%s\n' "$line"
+        fi
+    done < "$mirrorlist" > "$candidate" ||
+        die "failed to process $mirrorlist"
+
+    active_count=$(grep -c '^Server = ' "$candidate" || true)
     commented_count=$(grep -c "^${MARK}Server = " "$candidate" || true)
-    active_count=$(grep -c "^Server = " "$candidate" || true)
-    [[ "$active_count" -eq 0 ]] && zero_active=1
 
-    if ! cmp -s "$mirrorlist" "$candidate"; then
-        changed=1
+    if [[ "$active_count" -eq 0 ]]; then
+        zero_active=1
+    fi
+
+    assert_invariant "$mirrorlist" "$candidate" ||
+        die "invariant check failed for $mirrorlist; no changes committed"
+
+    if ! cmp -s -- "$mirrorlist" "$candidate"; then
         TARGETS+=("$mirrorlist")
         CANDIDATES+=("$candidate")
-    else
-        rm -f "$candidate"
     fi
 
     name=$(basename "$mirrorlist")
-    [[ "$name" == "mirrorlist" ]] && name="arch"
+    [[ "$name" == mirrorlist ]] && name=arch
     name="${name%-mirrorlist}"
 
-    [[ "$first" -eq 1 ]] || { SUMMARY+=' | '; SUMMARY_PLAIN+=' | '; }
+    [[ "$first" -eq 1 ]] || {
+        SUMMARY+=' | '
+        SUMMARY_PLAIN+=' | '
+    }
+
     SUMMARY+=$(printf '%s (%s%s%s/%s%s%s)' \
         "$name" "$GREEN" "$active_count" "$RESET" \
         "$RED" "$commented_count" "$RESET")
-    SUMMARY_PLAIN+=$(printf '%s (%s/%s)' "$name" "$active_count" "$commented_count")
+
+    SUMMARY_PLAIN+=$(printf '%s (%s/%s)' \
+        "$name" "$active_count" "$commented_count")
+
     first=0
 done
 
-if [[ "$changed" -eq 1 ]]; then
-    if [[ "$EUID" -ne 0 ]]; then
-        sudo -v || die "sudo authentication failed"
-    fi
-    for i in "${!TARGETS[@]}"; do
-        if [[ "$EUID" -eq 0 ]]; then
-            cp "${CANDIDATES[$i]}" "${TARGETS[$i]}"
-        else
-            sudo cp "${CANDIDATES[$i]}" "${TARGETS[$i]}"
-        fi
-    done
-fi
+print_summary() {
+    printf '==== mirror summary (%son%s/%soff%s): %s ====\n' \
+        "$GREEN" "$RESET" "$RED" "$RESET" "$SUMMARY"
+}
 
-printf "==== mirror summary (${GREEN}on${RESET}/${RED}off${RESET}): %s ====\n" "$SUMMARY"
-
+# Fail closed: do not commit if any mirrorlist would have no active server.
 if [[ "$zero_active" -eq 1 ]]; then
-    printf '%sWARNING:%s no active mirrors available in at least one repo; try again later.\n' \
+    print_summary
+    printf '%sWARNING:%s no active mirrors available in at least one repo; no changes committed.\n' \
         "$WARNING_STYLE" "$RESET"
-    desktop_notify "hm: no active mirrors" \
-        "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. Try again later."
+
+    desktop_notify 'hm: no active mirrors' \
+        "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. No changes committed."
+
     exit 1
 fi
+
+if [[ "${#TARGETS[@]}" -gt 0 ]]; then
+    transactional_commit ||
+        die 'mirrorlist update failed; check the errors above'
+fi
+
+print_summary
