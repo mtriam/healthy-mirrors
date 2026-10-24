@@ -1,0 +1,122 @@
+#!/usr/bin/python3 -u
+"""Hold open() of /etc/pacman.conf by pacman/shelly, run hm, then release."""
+import ctypes, os, re, select, signal, struct, subprocess, sys, time
+
+HM = os.environ.get("HM", "/usr/local/bin/hm")
+HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "60"))
+COOLDOWN = float(os.environ.get("COOLDOWN", "30"))   # min. seconds between hm runs
+WATCH = os.environ.get("WATCH", "/etc/pacman.conf").split(":")
+SHELLY_RE = re.compile(os.environ.get("SHELLY_RE", r"shelly.*"), re.I)
+
+FAN_CLOEXEC, FAN_CLASS_CONTENT = 0x1, 0x4
+FAN_OPEN_PERM, FAN_MARK_ADD, FAN_ALLOW = 0x10000, 0x1, 1
+AT_FDCWD = -100
+EVT = struct.Struct("=IBBHQii")   # event_len, vers, reserved, metadata_len, mask, fd, pid
+RESP = struct.Struct("=iI")       # fd, response
+
+libc = ctypes.CDLL(None, use_errno=True)
+libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
+libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64,
+                               ctypes.c_int, ctypes.c_char_p]
+
+def ppid_of(pid):
+    try:
+        with open(f"/proc/{pid}/stat") as f:
+            return int(f.read().rsplit(")", 1)[1].split()[1])
+    except Exception:
+        return 0
+
+def is_descendant(pid, root):
+    while pid > 1:
+        if pid == root:
+            return True
+        pid = ppid_of(pid)
+    return False
+
+def proc_info(pid):
+    try:
+        with open(f"/proc/{pid}/comm") as f:
+            comm = f.read().strip()
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+        return comm, args
+    except Exception:
+        return "?", []
+
+def should_trigger(comm, args):
+    if comm == "pacman":
+        # only operations that use mirrors: -S* and -U (not -Q, -T, -V, ...)
+        for a in args[1:]:
+            if a in ("--sync", "--upgrade"):
+                return True
+            if a.startswith("-") and not a.startswith("--") and re.search(r"[SU]", a):
+                return True
+        return False
+    return bool(SHELLY_RE.fullmatch(comm))
+
+def main():
+    fan = libc.fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, os.O_RDONLY)
+    if fan < 0:
+        sys.exit(f"fanotify_init: {os.strerror(ctypes.get_errno())}")
+    for path in WATCH:
+        if libc.fanotify_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, path.encode()) < 0:
+            sys.exit(f"fanotify_mark({path}): {os.strerror(ctypes.get_errno())}")
+    print(f"watching open() on: {WATCH}", flush=True)
+
+    held, hm, t0, last = [], None, 0.0, 0.0
+    me = os.getpid()
+
+    def allow(fd):
+        try:
+            os.write(fan, RESP.pack(fd, FAN_ALLOW))
+        finally:
+            os.close(fd)
+
+    def release(reason):
+        nonlocal held, hm, last
+        print(f"releasing {len(held)} held open() calls ({reason})", flush=True)
+        for fd in held:
+            allow(fd)
+        held, hm, last = [], None, time.time()
+
+    while True:
+        r, _, _ = select.select([fan], [], [], 0.2 if hm else None)
+        if r:
+            buf = os.read(fan, 65536)
+            off = 0
+            while off + EVT.size <= len(buf):
+                ln, _, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
+                off += ln
+                if fd < 0:
+                    continue
+                if pid == me or (hm and is_descendant(pid, hm.pid)):
+                    allow(fd)                        # own process / hm descendant: never block
+                elif hm:
+                    held.append(fd)                  # hm running: hold further openers
+                else:
+                    comm, args = proc_info(pid)
+                    ok = should_trigger(comm, args)
+                    cool = time.time() - last < COOLDOWN
+                    print(f"open pid={pid} comm={comm} cmd={' '.join(args)[:100]!r} "
+                          f"trigger={ok} cooldown={cool}", flush=True)
+                    if ok and not cool:
+                        hm = subprocess.Popen([HM], start_new_session=True)
+                        t0 = time.time()
+                        held.append(fd)
+                        print(f"started {HM} (pid {hm.pid})", flush=True)
+                    else:
+                        allow(fd)
+        if hm:
+            rc = hm.poll()
+            if rc is not None:
+                release(f"hm exited with code {rc}")
+            elif time.time() - t0 > HM_TIMEOUT:
+                try:
+                    os.killpg(hm.pid, signal.SIGKILL)
+                except ProcessLookupError:
+                    pass
+                hm.wait()
+                release("hm timed out")
+
+if __name__ == "__main__":
+    main()

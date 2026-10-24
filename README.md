@@ -1,12 +1,29 @@
 # healthy-mirrors
 
-Checks mirror health and automatically keeps only healthy mirrors active, helping avoid partial upgrades and broken system states.
+Checks mirror health and automatically keeps only healthy mirrors active, helping reduce the risk of partial upgrades and broken system states.
 
 ## What it does
 
-The script reads the mirror lists included from `/etc/pacman.conf`, checks the current CachyOS mirror status, and keeps only mirrors that are fully synced for the relevant architecture. It also includes healthy Arch mirrors from the Arch Linux mirror status API when applicable.
+The script reads the mirror lists included via /etc/pacman.conf and checks the current CachyOS and Arch Linux mirror status using their respective APIs.
 
-It then updates the mirrorlist files by commenting out unhealthy mirrors while leaving healthy ones active, and prints a summary of active vs. disabled mirrors.
+For CachyOS, it checks mirror synchronization separately for the x86_64, x86_64_v3, and x86_64_v4 architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
+
+For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchronized (completion_pct = 1.0), have a reported synchronization time, and have a delay of less than one hour.
+
+The script updates the mirrorlist files by commenting out unhealthy mirrors with a #UH# marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, allowing their status to be updated on each run.
+
+After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list. If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
+
+## hm-daemon
+
+An optional systemd service that uses Linux fanotify to monitor attempts to open /etc/pacman.conf and other configured files. When a relevant operation is detected, it temporarily holds the file-open requests, runs hm, and releases the waiting requests once the script finishes.
+
+The daemon triggers hm before mirror-related pacman operations (-S and -U) and matching shelly processes access the monitored files. Other operations, such as querying installed packages with pacman -Q, do not trigger a mirror check.
+
+While hm is running, additional file-open requests are held to prevent concurrent access before the mirror lists have been updated. Requests originating from the daemon itself or its hm subprocess are allowed through to avoid deadlocks.
+
+To reduce unnecessary executions, the daemon enforces a configurable cooldown between runs and terminates hm if it exceeds the configured timeout. Both normal completion and timeout handling release the waiting file-open requests.
+
 
 ## Requirements
 
@@ -14,7 +31,7 @@ It then updates the mirrorlist files by commenting out unhealthy mirrors while l
 - `jq`
 - `sed`
 - `grep`
-- `sudo` (only when mirrorlist files actually need updating)
+- `sudo` (only when mirrorlist files need to be updated)
 
 ## Install
 
@@ -22,63 +39,93 @@ Install system-wide to `/usr/local/bin`:
 
 ```bash
 curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install.sh | bash
+curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install-daemon.sh | bash
 ```
 
-The installer asks for `sudo` only to install the file. If `hm` is next to
-`install.sh`, it uses that local file instead of downloading it. It also adds
-the `up` function to zsh and fish configuration files when it is not already
-defined and the corresponding shell is installed. The manual equivalent is:
+## Manual install
 
 ```bash
-tmp=$(mktemp)
-curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/hm -o "$tmp"
-sudo install -m 755 "$tmp" /usr/local/bin/hm
-rm -f "$tmp"
+git clone https://github.com/mtriam/healthy-mirrors.git
+cd healthy-mirrors
+./install.sh
+./install-daemon.sh
 ```
-
-When the `shelly` program is installed, the installer also adds
-`alias shelly='hm && shelly'` to zsh (and an equivalent fish function), unless
-an alias or function with that name already exists.
 
 ## Uninstall
 
 ```bash
-sudo rm /usr/local/bin/hm
+sudo rm /usr/local/bin/hm  
+
+sudo systemctl disable --now hm-daemon.service 2>/dev/null || true
+sudo rm -f /etc/systemd/system/hm-daemon.service /usr/local/bin/hm-daemon
+sudo systemctl daemon-reload
 ```
 
-## Use
+## Diagnostics
+
+To follow the daemon logs in real time:
+
+```bash
+journalctl -fu hm-daemon.service
+```
+
+## Usage
+
+**If the daemon is installed and running, no additional action is needed**. It automatically runs `hm` when the mirror lists are accessed.
+
+
+## Manual use
+
+Without the daemon, run `hm` manually before using the mirror lists, or use the `up` shell functions described below.
 
 Run:
 
 ```bash
 hm
+```
+
+To remove the `#UH#` markers added by `hm`:
+
+```bash
 hm --clean
+```
+
+or:
+
+```bash
 hm -c
 ```
 
-`-c` / `--clean` restores the mirror list to its original state by removing only the `#UH#` marker prefix from previously flagged `Server = ...` lines, without deleting any active mirrors. Both modes compare the generated result with the current file first, so an unchanged run does not ask for `sudo`.
+The `-c` / `--clean` option removes only the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files.
 
-## Alias
+Both modes compare the generated result with the current file before writing changes, so an unchanged run does not ask for `sudo`.
 
-`up` refreshes the healthy mirror list, runs the system upgrade or package install, and finally restores the original mirrorlist state with `hm -c`.
+### Shell function: `up`
 
-zsh:
+The `up` function refreshes the healthy mirror list, runs a system upgrade or package installation, and then removes the `#UH#` markers using `hm -c`.
 
-```bash
-echo 'up() { hm && sudo pacman -Syu "$@"; hm -c; }' >> ~/.zshrc
-source ~/.zshrc
-```
+#### zsh
 
-fish:
+```zsh
+echo 'up() { hm && sudo pacman -Syu "$@"; }' >> ~/.zshrc
+source ~/.zshrc```
 
-```bash
-echo 'function up; hm; and sudo pacman -Syu $argv; or true; hm -c; end' >> ~/.config/fish/config.fish
+#### fish
+```fish
+echo 'function up; hm; and sudo pacman -Syu $argv; end' >> ~/.config/fish/config.fish
 source ~/.config/fish/config.fish
 ```
 
-Examples:
+### Examples
+
+Upgrade the system:
 
 ```bash
-up           # safely upgrade the system
-up firefox   # safely install Firefox
+up
+```
+
+Install a package while upgrading the system:
+
+```bash
+up firefox
 ```
