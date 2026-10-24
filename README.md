@@ -33,14 +33,6 @@ To reduce unnecessary executions, the daemon enforces a configurable cooldown be
 - `grep`
 - `sudo` (only when mirrorlist files need to be updated)
 
-## Install
-
-Install system-wide to `/usr/local/bin`:
-
-```bash
-curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install.sh | bash
-curl -fsSL https://raw.githubusercontent.com/mtriam/healthy-mirrors/main/install-daemon.sh | bash
-```
 
 ## Manual install
 
