@@ -123,6 +123,8 @@ desktop_notify() {
             continue
         }
 
+        # /run/user/$uid is mode 0700: do not test for the bus socket as root
+        # (the daemon's sandbox has no CAP_DAC_OVERRIDE); just try and report.
         if out=$(timeout 5 setpriv --reuid="$uid" --regid="$gid" \
                 --clear-groups \
                 env DBUS_SESSION_BUS_ADDRESS="unix:path=/run/user/$uid/bus" \
@@ -195,6 +197,29 @@ assert_invariant() {
 }
 
 # ---------------------------------------------------------------------------
+# Deferred termination
+#
+# A SIGTERM/SIGINT/SIGHUP that arrives while mirrorlists are being replaced
+# (e.g. when hm-daemon or the system is stopped) is remembered and acted on
+# only after the replacement has finished or been rolled back cleanly.
+# ---------------------------------------------------------------------------
+
+TERM_PENDING=0
+
+defer_termination() {
+    TERM_PENDING=0
+    trap 'TERM_PENDING=1' TERM INT HUP
+}
+
+allow_termination() {
+    trap - TERM INT HUP
+    if [[ "$TERM_PENDING" -eq 1 ]]; then
+        printf 'hm: terminated (deferred until the mirrorlist update finished)\n' >&2
+        exit 143
+    fi
+}
+
+# ---------------------------------------------------------------------------
 # Read pacman Include directives.
 # Expand ordinary shell globs and ignore missing optional files.
 # ---------------------------------------------------------------------------
@@ -260,6 +285,7 @@ WARNING_STYLE="$RED"
 # Prepare every staged file and backup before replacing any target.
 # Each individual rename is atomic. If a later rename fails, roll back
 # previously committed files. Backups are created alongside their targets.
+# (Authentication and termination deferral are handled by commit_changes.)
 # ---------------------------------------------------------------------------
 
 transactional_commit() {
@@ -273,15 +299,6 @@ transactional_commit() {
     }
 
     [[ "$count" -gt 0 ]] || return 0
-
-    # Authenticate once, before touching any system files. Subsequent
-    # run_priv calls reuse sudo's timestamp until it expires.
-    if [[ "$EUID" -ne 0 ]]; then
-        sudo -v || {
-            printf 'hm: sudo authentication failed\n' >&2
-            return 1
-        }
-    fi
 
     local -a STAGES=()
     local -a BACKUPS=()
@@ -393,6 +410,28 @@ transactional_commit() {
     return 0
 }
 
+# Authenticate once (may prompt), then run the replacement with termination
+# deferred, so it always ends in a consistent state.
+commit_changes() {
+    local rc
+
+    [[ "${#TARGETS[@]}" -gt 0 ]] || return 0
+
+    if [[ "$EUID" -ne 0 ]]; then
+        sudo -v || {
+            printf 'hm: sudo authentication failed\n' >&2
+            return 1
+        }
+    fi
+
+    defer_termination
+    transactional_commit
+    rc=$?
+    allow_termination
+
+    return "$rc"
+}
+
 # ---------------------------------------------------------------------------
 # Clean mode
 # ---------------------------------------------------------------------------
@@ -419,10 +458,7 @@ if [[ "$CLEAN" -eq 1 ]]; then
         fi
     done
 
-    if [[ "${#TARGETS[@]}" -gt 0 ]]; then
-        transactional_commit ||
-            die 'clean operation failed; check the errors above'
-    fi
+    commit_changes || die 'clean operation failed; check the errors above'
 
     exit 0
 fi
@@ -643,9 +679,6 @@ if [[ "$zero_active" -eq 1 ]]; then
     exit 1
 fi
 
-if [[ "${#TARGETS[@]}" -gt 0 ]]; then
-    transactional_commit ||
-        die 'mirrorlist update failed; check the errors above'
-fi
+commit_changes || die 'mirrorlist update failed; check the errors above'
 
 print_summary

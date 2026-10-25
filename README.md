@@ -32,7 +32,11 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly.
 - `hm` is killed if it runs longer than the timeout (default 30 s).
-- If a watched file is replaced (for example by an editor or a package update), the daemon re-marks the new inode within `RECHECK` seconds.
+- If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check.
+- On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway. If `hm` does not finish in time, it and its child processes are killed.
+- At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors.
+- Unrecoverable `fanotify` errors make the daemon log the reason and exit with a non-zero status (systemd restarts it, and the kernel releases pending requests).
+
 
 - **If `hm` fails or times out, the waiting program is still released and continues with the existing mirror lists.**
 - If the daemon stops, the kernel releases all held requests, so `pacman` cannot hang permanently.
@@ -40,6 +44,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 **Security**
 
 The daemon runs as root and executes `/usr/local/bin/hm` as root. `hm` and its parent directories must be owned by root and not writable by group or others; `install-daemon.sh` checks this. The service is hardened (`ProtectSystem=strict`, `NoNewPrivileges`, a minimal capability set, and write access only to the directories of mirrorlists included from `pacman.conf`).
+Process names are not authenticated: any local process named `pacman` (or matching `SHELLY_RE`/`HELPERS_RE`) that opens `pacman.conf` with a sync operation can trigger `hm`, at most once per `COOLDOWN`. This gives no privileges, because `hm` takes no input from the triggering process, but it can delay other `pacman` runs for the duration of one `hm` run.
 
 **Configuration**
 
@@ -63,7 +68,9 @@ Environment="HELPERS_RE=yay|paru"
 | `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated) |
 | `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` |
 | `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation |
-| `RECHECK` | `60` | Seconds between checks whether a watched file was replaced (new inode) and needs to be monitored again |
+| `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it. Replacements are normally detected immediately via inotify |
+| `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through |
+| `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped |
 ## Requirements
 
 `hm`:

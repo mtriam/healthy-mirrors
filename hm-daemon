@@ -1,12 +1,20 @@
 #!/usr/bin/python3 -u
-"""Hold open() of /etc/pacman.conf by pacman/shelly/AUR helpers, run hm, then release."""
-import ctypes, os, re, select, signal, struct, subprocess, sys, time
+"""Hold open() of /etc/pacman.conf by pacman/shelly/AUR helpers, run hm, then release.
+
+fanotify permission events are tied to an inode. When a watched file is replaced
+(rename or create), the old mark disappears together with the old inode, so an
+inotify watch on the parent directory re-marks the new file immediately. A slow
+periodic check (RECHECK) is kept as a safety net.
+"""
+import ctypes, errno, os, re, select, signal, struct, subprocess, sys, time
 
 HM = os.environ.get("HM", "/usr/local/bin/hm")
 HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "30"))
-COOLDOWN = float(os.environ.get("COOLDOWN", "60"))     # min. seconds between hm runs
-RECHECK = float(os.environ.get("RECHECK", "60"))        # seconds between checks whether a watched file was replaced
-WATCH = os.environ.get("WATCH", "/etc/pacman.conf").split(":")
+COOLDOWN = float(os.environ.get("COOLDOWN", "60"))        # min. seconds between hm runs
+RECHECK = float(os.environ.get("RECHECK", "600"))         # safety-net check interval, 0 = off
+MAX_HELD = int(os.environ.get("MAX_HELD", "256"))         # max. open() calls held while hm runs
+STOP_GRACE = float(os.environ.get("STOP_GRACE", "5"))     # seconds a running hm may finish on stop
+WATCH = [os.path.abspath(p) for p in os.environ.get("WATCH", "/etc/pacman.conf").split(":") if p]
 # always trigger (e.g. a program that only ever syncs/downloads)
 SHELLY_RE = re.compile(os.environ.get("SHELLY_RE", r"shelly.*"), re.I)
 # trigger only when run bare/with a package name, or with a sync/upgrade operation
@@ -19,10 +27,32 @@ AT_FDCWD = -100
 EVT = struct.Struct("=IBBHQii")   # event_len, vers, reserved, metadata_len, mask, fd, pid
 RESP = struct.Struct("=iI")       # fd, response
 
+IN_MOVED_TO, IN_CREATE = 0x80, 0x100
+IN_DELETE_SELF, IN_MOVE_SELF = 0x400, 0x800
+IN_UNMOUNT, IN_Q_OVERFLOW, IN_IGNORED = 0x2000, 0x4000, 0x8000
+IN_ONLYDIR, IN_ISDIR = 0x01000000, 0x40000000
+IN_WATCH_MASK = IN_ONLYDIR | IN_CREATE | IN_MOVED_TO | IN_DELETE_SELF | IN_MOVE_SELF
+INEVT = struct.Struct("=iIII")    # wd, mask, cookie, name length (name follows, NUL padded)
+
 libc = ctypes.CDLL(None, use_errno=True)
 libc.fanotify_init.argtypes = [ctypes.c_uint, ctypes.c_uint]
 libc.fanotify_mark.argtypes = [ctypes.c_int, ctypes.c_uint, ctypes.c_uint64,
                                ctypes.c_int, ctypes.c_char_p]
+libc.inotify_init1.argtypes = [ctypes.c_int]
+libc.inotify_add_watch.argtypes = [ctypes.c_int, ctypes.c_char_p, ctypes.c_uint32]
+libc.inotify_rm_watch.argtypes = [ctypes.c_int, ctypes.c_int]
+
+STOP = False
+
+
+class Fatal(Exception):
+    """Unrecoverable error: log, exit non-zero (systemd restarts; the kernel lets held opens through)."""
+
+
+def on_stop(signum, frame):
+    global STOP
+    STOP = True
+
 
 def ppid_of(pid):
     try:
@@ -31,6 +61,7 @@ def ppid_of(pid):
     except Exception:
         return 0
 
+
 def is_descendant(pid, root):
     while pid > 1:
         if pid == root:
@@ -38,9 +69,30 @@ def is_descendant(pid, root):
         pid = ppid_of(pid)
     return False
 
+
+def descendants(root):
+    """All live descendants of root, found by walking /proc parent links."""
+    children = {}
+    try:
+        names = os.listdir("/proc")
+    except OSError:
+        return []
+    for name in names:
+        if name.isdigit():
+            pid = int(name)
+            children.setdefault(ppid_of(pid), []).append(pid)
+    found, stack = [], [root]
+    while stack:
+        for child in children.get(stack.pop(), []):
+            found.append(child)
+            stack.append(child)
+    return found
+
+
 def printable(s):
     """Replace non-printable characters so that process data cannot forge log lines."""
     return "".join(c if c.isprintable() else "?" for c in s)
+
 
 def proc_info(pid):
     try:
@@ -51,6 +103,7 @@ def proc_info(pid):
         return comm, args
     except Exception:
         return "?", []
+
 
 def sync_ops(opts):
     """True if the option list contains an operation that downloads from mirrors."""
@@ -63,6 +116,7 @@ def sync_ops(opts):
             return True
     return "--files" in opts and "--refresh" in opts
 
+
 def should_trigger(comm, args):
     opts = [a for a in args[1:] if a.startswith("-")]
     if comm == "pacman":
@@ -73,6 +127,7 @@ def should_trigger(comm, args):
         return not opts or sync_ops(opts)
     return bool(SHELLY_RE.fullmatch(comm))
 
+
 def file_id(path):
     try:
         st = os.stat(path)
@@ -80,65 +135,202 @@ def file_id(path):
     except OSError:
         return None
 
+
 def add_mark(fan, path):
     """Returns 0 on success, errno on failure."""
     if libc.fanotify_mark(fan, FAN_MARK_ADD, FAN_OPEN_PERM, AT_FDCWD, path.encode()) < 0:
         return ctypes.get_errno()
     return 0
 
-def main():
-    fan = libc.fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, os.O_RDONLY)
+
+def run():
+    global STOP
+
+    fan = libc.fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, os.O_RDONLY | os.O_CLOEXEC)
     if fan < 0:
-        sys.exit(f"fanotify_init: {os.strerror(ctypes.get_errno())}")
-    marked = {}
-    for path in WATCH:
+        raise Fatal(f"fanotify_init: {os.strerror(ctypes.get_errno())}")
+    ino = libc.inotify_init1(os.O_NONBLOCK | os.O_CLOEXEC)
+    if ino < 0:
+        raise Fatal(f"inotify_init1: {os.strerror(ctypes.get_errno())}")
+
+    # signals wake up select() through a pipe; handlers only set a flag
+    sig_r, sig_w = os.pipe2(os.O_NONBLOCK | os.O_CLOEXEC)
+    signal.set_wakeup_fd(sig_w)
+    signal.signal(signal.SIGTERM, on_stop)
+    signal.signal(signal.SIGINT, on_stop)
+
+    dirs = sorted({os.path.dirname(p) for p in WATCH})
+    wd_dir = {}          # inotify watch descriptor -> directory
+    marked = {}          # watched file -> (st_dev, st_ino) it was marked with
+
+    def watch_dir(d):
+        wd = libc.inotify_add_watch(ino, d.encode(), IN_WATCH_MASK)
+        if wd < 0:
+            return ctypes.get_errno()
+        wd_dir[wd] = d
+        return 0
+
+    def remark(path, always):
+        """(Re)apply the fanotify mark. Idempotent; logs only when the inode actually changed."""
+        fid = file_id(path)
+        if fid is None:
+            return                        # gone for now; a later create/move event brings it back
+        if not always and fid == marked.get(path):
+            return
         err = add_mark(fan, path)
         if err:
-            sys.exit(f"fanotify_mark({path}): {os.strerror(err)}")
-        marked[path] = file_id(path)
+            print(f"re-marking {path} failed: {os.strerror(err)}", flush=True)
+            return
+        if fid != marked.get(path):
+            print(f"{path} was replaced, re-marked", flush=True)
+        marked[path] = fid
+
+    def resync(reason):
+        """Full check: restore lost directory watches, re-mark every file whose inode changed."""
+        known = set(wd_dir.values())
+        for d in dirs:
+            if d not in known:
+                err = watch_dir(d)
+                if err:
+                    print(f"re-adding watch on {d} failed: {os.strerror(err)}", flush=True)
+                else:
+                    print(f"watch on {d} restored ({reason})", flush=True)
+        for p in WATCH:
+            remark(p, always=False)
+
+    def handle_inotify():
+        try:
+            buf = os.read(ino, 65536)
+        except BlockingIOError:
+            return
+        except OSError as e:
+            raise Fatal(f"read from inotify failed: {e}")
+        off, need_resync = 0, False
+        while off + INEVT.size <= len(buf):
+            wd, mask, _cookie, ln = INEVT.unpack_from(buf, off)
+            name = buf[off + INEVT.size:off + INEVT.size + ln].split(b"\0", 1)[0]
+            off += INEVT.size + ln
+            if mask & IN_Q_OVERFLOW:
+                print("inotify queue overflow, checking all watched files", flush=True)
+                need_resync = True
+                continue
+            if mask & IN_MOVE_SELF:                    # directory itself was moved: watch points elsewhere
+                libc.inotify_rm_watch(ino, wd)
+                wd_dir.pop(wd, None)
+                need_resync = True
+                continue
+            if mask & (IN_IGNORED | IN_UNMOUNT | IN_DELETE_SELF):
+                if mask & IN_IGNORED:
+                    wd_dir.pop(wd, None)
+                need_resync = True
+                continue
+            d = wd_dir.get(wd)
+            if d is None or mask & IN_ISDIR or not mask & (IN_CREATE | IN_MOVED_TO):
+                continue
+            path = os.path.join(d, os.fsdecode(name))
+            if path in marked:
+                remark(path, always=True)
+        if need_resync:
+            resync("inotify")
+
+    # startup order matters: watch first, then mark, so no replacement can slip in between
+    for p in WATCH:
+        if os.path.islink(p):
+            print(f"warning: {p} is a symlink; replacement of its target is only found by the "
+                  f"periodic check (RECHECK)", flush=True)
+    for d in dirs:
+        err = watch_dir(d)
+        if err:
+            raise Fatal(f"inotify_add_watch({d}): {os.strerror(err)}")
+    for p in WATCH:
+        fid = file_id(p)
+        err = add_mark(fan, p)
+        if err:
+            raise Fatal(f"fanotify_mark({p}): {os.strerror(err)}")
+        marked[p] = fid
     print(f"watching open() on: {WATCH}", flush=True)
 
-    held, hm, t0, last = [], None, 0.0, 0.0
-    next_check = time.time() + RECHECK
+    held, hm = [], None
+    t0 = last = 0.0
+    limit_logged = False
+    stopping, stop_deadline = False, 0.0
+    next_check = time.time() + RECHECK if RECHECK > 0 else None
     me = os.getpid()
 
     def allow(fd):
+        """Answer FAN_ALLOW and close the event fd."""
         try:
             os.write(fan, RESP.pack(fd, FAN_ALLOW))
         except OSError as e:
-            print(f"allow(fd={fd}) failed: {e}", flush=True)
+            if e.errno == errno.ENOENT:           # requester already gone (killed): harmless
+                print(f"event fd={fd} is gone (requesting process ended)", flush=True)
+            else:
+                raise Fatal(f"fanotify response failed: {e}")
         finally:
             os.close(fd)
 
     def release(reason):
         nonlocal held, hm, last
         print(f"releasing {len(held)} held open() calls ({reason})", flush=True)
-        for fd in held:
+        fds, held = held, []
+        hm, last = None, time.time()
+        for fd in fds:
             allow(fd)
-        held, hm, last = [], None, time.time()
 
-    def recheck():
-        """A watched file replaced by rename has a new inode, so the old mark no longer applies."""
-        for path in WATCH:
-            fid = file_id(path)
-            if fid is None or fid == marked.get(path):
-                continue
-            err = add_mark(fan, path)
-            if err:
-                print(f"re-marking {path} failed: {os.strerror(err)}", flush=True)
-            else:
-                marked[path] = fid
-                print(f"{path} was replaced, re-marked", flush=True)
+    def stop_hm(reason):
+        """Kill hm and everything below it (also children that left hm's process group), then release."""
+        pids = descendants(hm.pid)                # collect first: after the kill, orphans lose their ancestry
+        try:
+            os.killpg(hm.pid, signal.SIGKILL)
+        except ProcessLookupError:
+            pass
+        for p in pids:
+            try:
+                os.kill(p, signal.SIGKILL)
+            except (ProcessLookupError, PermissionError):
+                pass
+        try:
+            hm.wait(timeout=5)
+        except subprocess.TimeoutExpired:
+            print(f"hm (pid {hm.pid}) did not exit after SIGKILL", flush=True)
+        release(reason)
 
     while True:
-        r, _, _ = select.select([fan], [], [], 0.2 if hm else RECHECK)
-        if r:
-            buf = os.read(fan, 65536)
+        if STOP and not stopping:
+            stopping = True
+            stop_deadline = time.time() + STOP_GRACE
+            print("stop requested" + (f", letting hm finish (up to {STOP_GRACE:g} s)" if hm else ""),
+                  flush=True)
+        if stopping and (hm is None or time.time() > stop_deadline):
+            if hm is not None:
+                stop_hm("hm did not finish within the stop grace period")
+            break
+
+        if hm:
+            timeout = 0.2
+        elif next_check is not None:
+            timeout = max(0.0, next_check - time.time())
+        else:
+            timeout = None
+        r, _, _ = select.select([fan, ino, sig_r], [], [], timeout)
+
+        if sig_r in r:
+            try:
+                os.read(sig_r, 4096)
+            except BlockingIOError:
+                pass
+        if ino in r:                                # before fanotify: re-mark as early as possible
+            handle_inotify()
+        if fan in r:
+            try:
+                buf = os.read(fan, 65536)
+            except OSError as e:
+                raise Fatal(f"read from fanotify failed: {e}")
             off = 0
             while off + EVT.size <= len(buf):
                 ln, vers, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
                 if vers != FANOTIFY_METADATA_VERSION:
-                    sys.exit(f"unsupported fanotify metadata version: {vers}")
+                    raise Fatal(f"unsupported fanotify metadata version: {vers}")
                 if ln < EVT.size:
                     break
                 off += ln
@@ -146,8 +338,17 @@ def main():
                     continue
                 if pid == me or (hm and is_descendant(pid, hm.pid)):
                     allow(fd)                        # own process / hm descendant: never block
+                elif stopping:
+                    allow(fd)                        # shutting down: do not hold anything new
                 elif hm:
-                    held.append(fd)                  # hm running: hold further openers
+                    if len(held) >= MAX_HELD:
+                        if not limit_logged:
+                            print(f"hold limit ({MAX_HELD}) reached, letting further opens through",
+                                  flush=True)
+                            limit_logged = True
+                        allow(fd)
+                    else:
+                        held.append(fd)              # hm running: hold further openers
                 else:
                     comm, args = proc_info(pid)
                     ok = should_trigger(comm, args)
@@ -156,31 +357,42 @@ def main():
                           f"trigger={ok} cooldown={cool}", flush=True)
                     if ok and not cool:
                         try:
-                            hm = subprocess.Popen([HM], start_new_session=True)
+                            hm = subprocess.Popen([HM], stdin=subprocess.DEVNULL,
+                                                  start_new_session=True)
                         except OSError as e:
                             print(f"cannot start {HM}: {e}", flush=True)
                             last = time.time()       # do not retry on every open
                             allow(fd)
                         else:
                             t0 = time.time()
+                            limit_logged = False
                             held.append(fd)
                             print(f"started {HM} (pid {hm.pid})", flush=True)
                     else:
                         allow(fd)
+
         if hm:
             rc = hm.poll()
             if rc is not None:
                 release(f"hm exited with code {rc}")
             elif time.time() - t0 > HM_TIMEOUT:
-                try:
-                    os.killpg(hm.pid, signal.SIGKILL)
-                except ProcessLookupError:
-                    pass
-                hm.wait()
-                release("hm timed out")
-        elif time.time() >= next_check:
-            recheck()
+                stop_hm("hm timed out")
+        elif next_check is not None and time.time() >= next_check:
+            resync("periodic")
             next_check = time.time() + RECHECK
+
+    if held:
+        release("shutdown")
+    print("stopped", flush=True)
+
+
+def main():
+    try:
+        run()
+    except Fatal as e:
+        print(f"fatal: {e}", flush=True)
+        sys.exit(1)
+
 
 if __name__ == "__main__":
     main()
