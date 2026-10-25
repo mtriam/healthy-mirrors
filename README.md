@@ -140,6 +140,36 @@ journalctl -fu hm-daemon.service
 
 Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`).
 
+## Tests
+
+`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instance (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
+
+```bash
+./test-hm-daemon.sh                      # uses ./hm-daemon
+./test-hm-daemon.sh /path/to/hm-daemon
+```
+
+The script re-runs itself with `sudo` (fanotify permission events need root). It needs `python3`, `awk`, `pkill`/`pgrep` (procps-ng), `timeout` and coreutils, plus a kernel with fanotify permission events.
+
+| # | What is checked |
+|---|---|
+| 1 | The mark follows a replaced file (`mv`, `sed -i`, `rm` + create, `ln -f`, in-place write): after each change a fake `pacman --sync` still triggers `hm` |
+| 2 | `SIGTERM` while a request is held: the request is released after `STOP_GRACE`, the daemon exits with code 0 and the stub `hm` is killed |
+| 3 | `SIGKILL` of the daemon while a request is held: the kernel lets the request through |
+| 4 | `MAX_HELD`: with a limit of 5, exactly 5 of 12 concurrent requests are held, the rest pass |
+| 5 | `hm` cannot be started: the request is not left blocked and the error is logged |
+
+A successful run ends with `passed: 15, failed: 0` and exit status 0. Test 1 depends on timing (the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case of test 1 fails on a heavily loaded system, run the script again before investigating.
+
+The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications or the systemd sandbox. Check those with:
+
+```bash
+hm --notify-test                  # notification path of a regular user
+sudo hm                           # real run; then: grep -c '^#UH#' /etc/pacman.d/*mirrorlist*
+sudo hm --clean                   # removes the markers again
+journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Ss foo`
+```
+
 ## Usage
 
 **If the daemon is installed and running, no additional action is needed.**
