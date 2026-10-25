@@ -16,7 +16,7 @@ FAIL=0
 
 cleanup() {
     [[ -n $DPID ]] && kill -KILL "$DPID" 2>/dev/null
-    pkill -f '^sleep 20$' 2>/dev/null
+    pkill -f '^sleep (20|22|23)$' 2>/dev/null
     rm -rf "$T"
 }
 trap cleanup EXIT
@@ -33,6 +33,7 @@ pac()     { "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1; }   # looks like "pac
 started() { grep -c '^started ' "$LOG"; }
 secs()    { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }'; }
 between() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v >= lo && v <= hi) }'; }
+alive()   { local n=0 p; for p in "$@"; do kill -0 "$p" 2>/dev/null && n=$((n + 1)); done; echo "$n"; }
 
 start_daemon() {          # extra NAME=value arguments are passed to the daemon's environment
     env WATCH="$CONF" HM="$T/slow-hm" COOLDOWN=0 RECHECK=0 "$@" python3 -u "$D" > "$LOG" 2>&1 &
@@ -64,7 +65,7 @@ replace_test "sed -i"                 bash -c 'sed -i "s/^\[options\]/[options]/
 replace_test "rm + create"            bash -c 'rm "$0" && echo "[options]" > "$0"' "$CONF"
 replace_test "ln -f (hard link)"      bash -c 'echo "[options]" > "$0.other" && ln -f "$0.other" "$0"' "$CONF"
 replace_test "in-place write"         bash -c 'echo "# x" >> "$0"' "$CONF"
-grep -qE 'Traceback|^fatal:' "$LOG" && bad "daemon logged an error (see below)" && cat "$LOG"
+grep -qE 'Traceback|^(<[0-7]>)?fatal:' "$LOG" && bad "daemon logged an error (see below)" && cat "$LOG"
 stop_daemon
 
 echo "== 2. SIGTERM while a request is held (hm still running)"
@@ -83,15 +84,18 @@ wait "$DPID" 2>/dev/null; RC=$?; DPID=
 grep -q 'stop requested' "$LOG" && grep -q 'releasing 1 held' "$LOG" && ok "stop logged" || bad "stop not logged"
 pgrep -f '^sleep 20$' >/dev/null && bad "hm child still running" || ok "hm child killed"
 
-echo "== 3. SIGKILL of the daemon while a request is held (kernel behaviour)"
+echo "== 3. SIGKILL of the daemon while several requests are held (kernel behaviour)"
 start_daemon SLOW=20
-pac & PP=$!
+pids=()
+for _ in $(seq 6); do pac & pids+=($!); done
 sleep 1
+n=$(alive "${pids[@]}")
+[[ $n -eq 6 ]] && ok "all 6 requests are held while hm runs" || bad "only $n of 6 requests are held"
 kill -KILL "$DPID"
 wait "$DPID" 2>/dev/null; DPID=
-for _ in $(seq 20); do kill -0 "$PP" 2>/dev/null || break; sleep 0.1; done
-kill -0 "$PP" 2>/dev/null && bad "request still blocked 2 s after the daemon died" \
-                          || ok "kernel released the held request"
+for _ in $(seq 20); do [[ $(alive "${pids[@]}") -eq 0 ]] && break; sleep 0.1; done
+n=$(alive "${pids[@]}")
+[[ $n -eq 0 ]] && ok "kernel released all held requests" || bad "$n requests still blocked 2 s after the daemon died"
 pkill -f '^sleep 20$' 2>/dev/null
 
 echo "== 4. hold limit"
@@ -108,6 +112,43 @@ start_daemon HM=/nonexistent
 timeout 3 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
 [[ $? -ne 124 ]] && ok "request was not left blocked" || bad "request stayed blocked"
 grep -q 'cannot start' "$LOG" && ok "start failure logged" || bad "start failure not logged"
+stop_daemon
+
+echo "== 6. hm timeout kills hm and a child that left its process group"
+printf '#!/bin/sh\nsetsid sleep 23 &\nexec sleep 22\n' > "$T/tree-hm"
+chmod +x "$T/tree-hm"
+start_daemon HM="$T/tree-hm" HM_TIMEOUT=2
+T0=$(date +%s.%N)
+pac & PP=$!
+sleep 1
+pgrep -f '^sleep 23$' >/dev/null && ok "child runs in its own session" || bad "child did not start (test setup)"
+wait "$PP" 2>/dev/null
+E=$(secs "$T0")
+between "$E" 1.5 4.5 && ok "request released after the hm timeout (${E}s)" \
+                      || bad "request released after ${E}s (expected about 2s)"
+pgrep -f '^sleep 23$' >/dev/null && bad "child in another session survived" || ok "child in another session killed"
+pgrep -f '^sleep 22$' >/dev/null && bad "hm survived the timeout" || ok "hm killed"
+stop_daemon
+
+echo "== 7. invalid configuration is rejected at startup"
+check_rejected() {        # $1 = NAME=value
+    local out rc
+    out=$(timeout 5 env WATCH="$CONF" HM="$T/slow-hm" "$1" python3 -u "$D" 2>&1)
+    rc=$?
+    if [[ $rc -eq 1 && $out == *"${1%%=*}"* ]]; then
+        ok "$1 rejected (exit 1, message names the variable)"
+    else
+        bad "$1 not rejected as expected (exit $rc): $out"
+    fi
+}
+check_rejected MAX_HELD=0
+check_rejected HM_TIMEOUT=nan
+
+echo "== 8. symlinked watch path with the periodic check disabled"
+ln -s "$CONF" "$T/link.conf"
+start_daemon WATCH="$T/link.conf"
+grep -q 'will not be detected' "$LOG" && ok "symlink warning says that replacement will not be detected" \
+                                       || bad "symlink warning missing or wrong"
 stop_daemon
 
 echo

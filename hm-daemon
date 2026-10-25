@@ -5,20 +5,24 @@ fanotify permission events are tied to an inode. When a watched file is replaced
 (rename or create), the old mark disappears together with the old inode, so an
 inotify watch on the parent directory re-marks the new file immediately. A slow
 periodic check (RECHECK) is kept as a safety net.
-"""
-import ctypes, errno, os, re, select, signal, struct, subprocess, sys, time
 
-HM = os.environ.get("HM", "/usr/local/bin/hm")
-HM_TIMEOUT = float(os.environ.get("HM_TIMEOUT", "30"))
-COOLDOWN = float(os.environ.get("COOLDOWN", "60"))        # min. seconds between hm runs
-RECHECK = float(os.environ.get("RECHECK", "600"))         # safety-net check interval, 0 = off
-MAX_HELD = int(os.environ.get("MAX_HELD", "256"))         # max. open() calls held while hm runs
-STOP_GRACE = float(os.environ.get("STOP_GRACE", "5"))     # seconds a running hm may finish on stop
-WATCH = [os.path.abspath(p) for p in os.environ.get("WATCH", "/etc/pacman.conf").split(":") if p]
-# always trigger (e.g. a program that only ever syncs/downloads)
-SHELLY_RE = re.compile(os.environ.get("SHELLY_RE", r"shelly.*"), re.I)
-# trigger only when run bare/with a package name, or with a sync/upgrade operation
-HELPERS_RE = re.compile(os.environ.get("HELPERS_RE", r"yay|paru|pikaur|trizen|octopi"), re.I)
+Exit status: 0 after a requested stop, 1 for invalid configuration or an
+infrastructure error, 2 for an unexpected internal error (the traceback is logged).
+Whatever the reason, the kernel allows all outstanding permission requests when the
+fanotify descriptor is closed (fanotify(7)), so a dying daemon never leaves programs
+blocked; before exiting, the daemon also tries to answer them itself.
+"""
+import ctypes, errno, math, os, re, select, signal, struct, subprocess, sys, time, traceback
+
+# journald priority prefixes (journald strips them; see "journalctl -p warning")
+ERR, WARN = "<3>", "<4>"
+
+# configuration, filled in by load_config()
+HM = ""
+HM_TIMEOUT = COOLDOWN = RECHECK = STOP_GRACE = 0.0
+MAX_HELD = 0
+WATCH = []
+SHELLY_RE = HELPERS_RE = None
 
 FAN_CLOEXEC, FAN_CLASS_CONTENT = 0x1, 0x4
 FAN_OPEN_PERM, FAN_MARK_ADD, FAN_ALLOW = 0x10000, 0x1, 1
@@ -46,13 +50,75 @@ STOP = False
 
 
 class Fatal(Exception):
-    """Unrecoverable error: log, exit non-zero (systemd restarts; the kernel lets held opens through)."""
+    """Invalid configuration or unrecoverable infrastructure error: log it and exit with status 1."""
+
+
+def log(msg, level=""):
+    print(f"{level}{msg}", flush=True)
 
 
 def on_stop(signum, frame):
     global STOP
     STOP = True
 
+
+# ---------------------------------------------------------------------------
+# Configuration (validated once, at startup)
+# ---------------------------------------------------------------------------
+
+def env_float(name, default, minimum, exclusive=False):
+    raw = os.environ.get(name, default)
+    try:
+        value = float(raw)
+    except ValueError:
+        raise Fatal(f"invalid {name}={raw!r}: not a number")
+    if not math.isfinite(value) or value < minimum or (exclusive and value == minimum):
+        raise Fatal(f"invalid {name}={raw!r}: must be a finite number "
+                    f"{'>' if exclusive else '>='} {minimum:g}")
+    return value
+
+
+def env_int(name, default, minimum):
+    raw = os.environ.get(name, default)
+    try:
+        value = int(raw)
+    except ValueError:
+        raise Fatal(f"invalid {name}={raw!r}: not an integer")
+    if value < minimum:
+        raise Fatal(f"invalid {name}={raw!r}: must be an integer >= {minimum}")
+    return value
+
+
+def env_regex(name, default):
+    raw = os.environ.get(name, default)
+    try:
+        return re.compile(raw, re.I)
+    except re.error as e:
+        raise Fatal(f"invalid {name}={raw!r}: {e}")
+
+
+def load_config():
+    global HM, HM_TIMEOUT, COOLDOWN, RECHECK, MAX_HELD, STOP_GRACE, WATCH, SHELLY_RE, HELPERS_RE
+    HM = os.environ.get("HM", "/usr/local/bin/hm")
+    if not os.path.isabs(HM):
+        raise Fatal(f"invalid HM={HM!r}: must be an absolute path")
+    HM_TIMEOUT = env_float("HM_TIMEOUT", "30", 0, exclusive=True)   # seconds before hm is killed
+    COOLDOWN = env_float("COOLDOWN", "60", 0)                      # min. seconds between hm runs
+    RECHECK = env_float("RECHECK", "600", 0)                       # safety-net check interval, 0 = off
+    MAX_HELD = env_int("MAX_HELD", "256", 1)                       # max. open() calls held while hm runs
+    STOP_GRACE = env_float("STOP_GRACE", "5", 0)                   # seconds a running hm may finish on stop
+    WATCH = [os.path.abspath(p) for p in os.environ.get("WATCH", "/etc/pacman.conf").split(":") if p]
+    if not WATCH:
+        raise Fatal("invalid WATCH: no file given")
+    # always trigger (e.g. a program that only ever syncs/downloads)
+    SHELLY_RE = env_regex("SHELLY_RE", r"shelly.*")
+    # trigger only when run bare/with a package name, or with a sync/upgrade operation
+    HELPERS_RE = env_regex("HELPERS_RE", r"yay|paru|pikaur|trizen|octopi")
+
+
+# ---------------------------------------------------------------------------
+# Process helpers
+# ---------------------------------------------------------------------------
 
 def ppid_of(pid):
     try:
@@ -143,9 +209,11 @@ def add_mark(fan, path):
     return 0
 
 
-def run():
-    global STOP
+# ---------------------------------------------------------------------------
+# Main loop
+# ---------------------------------------------------------------------------
 
+def run():
     fan = libc.fanotify_init(FAN_CLOEXEC | FAN_CLASS_CONTENT, os.O_RDONLY | os.O_CLOEXEC)
     if fan < 0:
         raise Fatal(f"fanotify_init: {os.strerror(ctypes.get_errno())}")
@@ -179,10 +247,10 @@ def run():
             return
         err = add_mark(fan, path)
         if err:
-            print(f"re-marking {path} failed: {os.strerror(err)}", flush=True)
+            log(f"re-marking {path} failed: {os.strerror(err)}", ERR)
             return
         if fid != marked.get(path):
-            print(f"{path} was replaced, re-marked", flush=True)
+            log(f"{path} was replaced, re-marked")
         marked[path] = fid
 
     def resync(reason):
@@ -192,9 +260,9 @@ def run():
             if d not in known:
                 err = watch_dir(d)
                 if err:
-                    print(f"re-adding watch on {d} failed: {os.strerror(err)}", flush=True)
+                    log(f"re-adding watch on {d} failed: {os.strerror(err)}", ERR)
                 else:
-                    print(f"watch on {d} restored ({reason})", flush=True)
+                    log(f"watch on {d} restored ({reason})")
         for p in WATCH:
             remark(p, always=False)
 
@@ -211,7 +279,7 @@ def run():
             name = buf[off + INEVT.size:off + INEVT.size + ln].split(b"\0", 1)[0]
             off += INEVT.size + ln
             if mask & IN_Q_OVERFLOW:
-                print("inotify queue overflow, checking all watched files", flush=True)
+                log("inotify queue overflow, checking all watched files", WARN)
                 need_resync = True
                 continue
             if mask & IN_MOVE_SELF:                    # directory itself was moved: watch points elsewhere
@@ -236,8 +304,12 @@ def run():
     # startup order matters: watch first, then mark, so no replacement can slip in between
     for p in WATCH:
         if os.path.islink(p):
-            print(f"warning: {p} is a symlink; replacement of its target is only found by the "
-                  f"periodic check (RECHECK)", flush=True)
+            if RECHECK > 0:
+                log(f"warning: {p} is a symlink; replacement of its target is only found by the "
+                    f"periodic check (every {RECHECK:g} s)", WARN)
+            else:
+                log(f"warning: {p} is a symlink and the periodic check is disabled (RECHECK=0); "
+                    f"replacement of its target will not be detected", WARN)
     for d in dirs:
         err = watch_dir(d)
         if err:
@@ -248,7 +320,7 @@ def run():
         if err:
             raise Fatal(f"fanotify_mark({p}): {os.strerror(err)}")
         marked[p] = fid
-    print(f"watching open() on: {WATCH}", flush=True)
+    log(f"watching open() on: {WATCH}")
 
     held, hm = [], None
     t0 = last = 0.0
@@ -263,22 +335,38 @@ def run():
             os.write(fan, RESP.pack(fd, FAN_ALLOW))
         except OSError as e:
             if e.errno == errno.ENOENT:           # requester already gone (killed): harmless
-                print(f"event fd={fd} is gone (requesting process ended)", flush=True)
+                log(f"event fd={fd} is gone (requesting process ended)")
             else:
                 raise Fatal(f"fanotify response failed: {e}")
         finally:
             os.close(fd)
 
     def release(reason):
-        nonlocal held, hm, last
-        print(f"releasing {len(held)} held open() calls ({reason})", flush=True)
-        fds, held = held, []
+        """Answer every held request, one by one (a failure leaves the rest in `held`)."""
+        nonlocal hm, last
+        log(f"releasing {len(held)} held open() calls ({reason})")
         hm, last = None, time.time()
-        for fd in fds:
-            allow(fd)
+        while held:
+            allow(held.pop(0))
 
-    def stop_hm(reason):
+    def abandon_held(reason):
+        """Best effort before exiting after an error; the kernel allows whatever is left on exit."""
+        if held:
+            log(f"{reason}: answering {len(held)} held open() calls before exit", WARN)
+        while held:
+            fd = held.pop(0)
+            try:
+                os.write(fan, RESP.pack(fd, FAN_ALLOW))
+            except OSError:
+                pass
+            try:
+                os.close(fd)
+            except OSError:
+                pass
+
+    def stop_hm(reason, level=ERR):
         """Kill hm and everything below it (also children that left hm's process group), then release."""
+        log(f"{reason}; killing hm", level)
         pids = descendants(hm.pid)                # collect first: after the kill, orphans lose their ancestry
         try:
             os.killpg(hm.pid, signal.SIGKILL)
@@ -292,106 +380,127 @@ def run():
         try:
             hm.wait(timeout=5)
         except subprocess.TimeoutExpired:
-            print(f"hm (pid {hm.pid}) did not exit after SIGKILL", flush=True)
+            log(f"hm (pid {hm.pid}) did not exit after SIGKILL", ERR)
         release(reason)
 
-    while True:
-        if STOP and not stopping:
-            stopping = True
-            stop_deadline = time.time() + STOP_GRACE
-            print("stop requested" + (f", letting hm finish (up to {STOP_GRACE:g} s)" if hm else ""),
-                  flush=True)
-        if stopping and (hm is None or time.time() > stop_deadline):
-            if hm is not None:
-                stop_hm("hm did not finish within the stop grace period")
-            break
+    try:
+        while True:
+            if STOP and not stopping:
+                stopping = True
+                stop_deadline = time.time() + STOP_GRACE
+                log("stop requested" + (f", letting hm finish (up to {STOP_GRACE:g} s)" if hm else ""))
+            if stopping and (hm is None or time.time() > stop_deadline):
+                if hm is not None:
+                    stop_hm("hm did not finish within the stop grace period", WARN)
+                break
 
-        if hm:
-            timeout = 0.2
-        elif next_check is not None:
-            timeout = max(0.0, next_check - time.time())
-        else:
-            timeout = None
-        r, _, _ = select.select([fan, ino, sig_r], [], [], timeout)
+            if hm:
+                timeout = 0.2
+            elif next_check is not None:
+                timeout = max(0.0, next_check - time.time())
+            else:
+                timeout = None
+            r, _, _ = select.select([fan, ino, sig_r], [], [], timeout)
 
-        if sig_r in r:
-            try:
-                os.read(sig_r, 4096)
-            except BlockingIOError:
-                pass
-        if ino in r:                                # before fanotify: re-mark as early as possible
-            handle_inotify()
-        if fan in r:
-            try:
-                buf = os.read(fan, 65536)
-            except OSError as e:
-                raise Fatal(f"read from fanotify failed: {e}")
-            off = 0
-            while off + EVT.size <= len(buf):
-                ln, vers, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
-                if vers != FANOTIFY_METADATA_VERSION:
-                    raise Fatal(f"unsupported fanotify metadata version: {vers}")
-                if ln < EVT.size:
-                    break
-                off += ln
-                if fd < 0:
-                    continue
-                if pid == me or (hm and is_descendant(pid, hm.pid)):
-                    allow(fd)                        # own process / hm descendant: never block
-                elif stopping:
-                    allow(fd)                        # shutting down: do not hold anything new
-                elif hm:
-                    if len(held) >= MAX_HELD:
-                        if not limit_logged:
-                            print(f"hold limit ({MAX_HELD}) reached, letting further opens through",
-                                  flush=True)
-                            limit_logged = True
-                        allow(fd)
-                    else:
-                        held.append(fd)              # hm running: hold further openers
-                else:
-                    comm, args = proc_info(pid)
-                    ok = should_trigger(comm, args)
-                    cool = time.time() - last < COOLDOWN
-                    print(f"open pid={pid} comm={comm} cmd={' '.join(args)[:100]!r} "
-                          f"trigger={ok} cooldown={cool}", flush=True)
-                    if ok and not cool:
-                        try:
-                            hm = subprocess.Popen([HM], stdin=subprocess.DEVNULL,
-                                                  start_new_session=True)
-                        except OSError as e:
-                            print(f"cannot start {HM}: {e}", flush=True)
-                            last = time.time()       # do not retry on every open
+            if sig_r in r:
+                try:
+                    os.read(sig_r, 4096)
+                except BlockingIOError:
+                    pass
+            if ino in r:                                # before fanotify: re-mark as early as possible
+                handle_inotify()
+            if fan in r:
+                try:
+                    buf = os.read(fan, 65536)
+                except OSError as e:
+                    raise Fatal(f"read from fanotify failed: {e}")
+                off = 0
+                while off + EVT.size <= len(buf):
+                    ln, vers, _, _, mask, fd, pid = EVT.unpack_from(buf, off)
+                    if vers != FANOTIFY_METADATA_VERSION:
+                        raise Fatal(f"unsupported fanotify metadata version: {vers}")
+                    if ln < EVT.size:
+                        break
+                    off += ln
+                    if fd < 0:
+                        continue
+                    if pid == me or (hm and is_descendant(pid, hm.pid)):
+                        allow(fd)                        # own process / hm descendant: never block
+                    elif stopping:
+                        allow(fd)                        # shutting down: do not hold anything new
+                    elif hm:
+                        if len(held) >= MAX_HELD:
+                            if not limit_logged:
+                                log(f"hold limit ({MAX_HELD}) reached, letting further opens through "
+                                    f"(they may proceed with the previous mirror lists)", WARN)
+                                limit_logged = True
                             allow(fd)
                         else:
-                            t0 = time.time()
-                            limit_logged = False
-                            held.append(fd)
-                            print(f"started {HM} (pid {hm.pid})", flush=True)
+                            held.append(fd)              # hm running: hold further openers
                     else:
-                        allow(fd)
+                        try:
+                            comm, args = proc_info(pid)
+                            ok = should_trigger(comm, args)
+                        except Exception as e:           # a bug in classification must not take the daemon down
+                            log(f"cannot classify pid={pid}: {e!r}; letting it through", WARN)
+                            comm, args, ok = "?", [], False
+                        cool = time.time() - last < COOLDOWN
+                        log(f"open pid={pid} comm={comm} cmd={' '.join(args)[:100]!r} "
+                            f"trigger={ok} cooldown={cool}")
+                        if ok and not cool:
+                            try:
+                                hm = subprocess.Popen([HM], stdin=subprocess.DEVNULL,
+                                                      start_new_session=True)
+                            except OSError as e:
+                                log(f"cannot start {HM}: {e}", ERR)
+                                last = time.time()       # do not retry on every open
+                                allow(fd)
+                            else:
+                                t0 = time.time()
+                                limit_logged = False
+                                held.append(fd)
+                                log(f"started {HM} (pid {hm.pid})")
+                        else:
+                            allow(fd)
 
-        if hm:
-            rc = hm.poll()
-            if rc is not None:
-                release(f"hm exited with code {rc}")
-            elif time.time() - t0 > HM_TIMEOUT:
-                stop_hm("hm timed out")
-        elif next_check is not None and time.time() >= next_check:
-            resync("periodic")
-            next_check = time.time() + RECHECK
+            if hm:
+                rc = hm.poll()
+                if rc is not None:
+                    if rc == 0:
+                        log("hm finished OK")
+                    else:
+                        log(f"hm FAILED (exit code {rc}); held programs continue with the "
+                            f"existing mirror lists", ERR)
+                    release(f"hm exited with code {rc}")
+                elif time.time() - t0 > HM_TIMEOUT:
+                    stop_hm(f"hm timed out after {HM_TIMEOUT:g} s")
+            elif next_check is not None and time.time() >= next_check:
+                resync("periodic")
+                next_check = time.time() + RECHECK
 
-    if held:
-        release("shutdown")
-    print("stopped", flush=True)
+        if held:
+            release("shutdown")
+        log("stopped")
+    except Fatal:
+        abandon_held("fatal error")
+        raise
+    except Exception:
+        abandon_held("unexpected error")
+        raise
 
 
 def main():
     try:
+        load_config()
         run()
     except Fatal as e:
-        print(f"fatal: {e}", flush=True)
+        log(f"fatal: {e}", ERR)
         sys.exit(1)
+    except Exception:
+        log("fatal: unexpected internal error (traceback follows)", ERR)
+        traceback.print_exc()
+        sys.stderr.flush()
+        sys.exit(2)
 
 
 if __name__ == "__main__":

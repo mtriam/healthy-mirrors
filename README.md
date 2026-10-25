@@ -30,7 +30,7 @@ For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchr
 
 The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
 
-Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror. API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
+Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror, so a failed run leaves the mirrorlists as they were (never half-written). API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
 
 After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list. If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
 
@@ -171,13 +171,14 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - While `hm` is running, other processes opening the monitored files are held as well, so nothing reads the mirror lists before they are updated. From the user's side, `pacman` simply waits at startup without any message.
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly. It also applies after a failed or timed-out run.
-- `hm` is killed (together with its child processes) if it runs longer than the timeout (default 30 s).
-- **If `hm` fails or times out, the waiting program is still released and continues with the existing mirror lists.**
-- If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check.
+- **The daemon guarantees a check before the operation, not that the check succeeds.** If `hm` fails or times out, the waiting programs are still released and continue with the existing mirror lists. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run), shows a desktop notification, and the daemon logs `hm FAILED (exit code N)` or `hm TIMED OUT` at error priority.
+- On timeout (default 30 s) `hm` is killed together with its child processes. Children are found through their parent links, also when they moved to another session or process group; a process that detaches completely from `hm`'s process tree (double fork) is not tracked, which `hm` never does.
+- If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check (and not at all with `RECHECK=0`).
 - On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway.
-- At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors.
-- Unrecoverable `fanotify` errors make the daemon log the reason and exit with a non-zero status (systemd restarts it).
-- If the daemon dies or is killed, the kernel releases all held requests, so `pacman` cannot hang permanently.
+- At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors. This trades strict enforcement for availability: requests beyond the limit may proceed with the previous mirror lists.
+- Invalid configuration (see the table below) stops the daemon at startup with a message that names the variable. Unrecoverable `fanotify`/`inotify` errors do the same at runtime.
+- Exit status: `0` after a requested stop, `1` for invalid configuration or an infrastructure error, `2` for an unexpected internal error (the traceback is in the journal). Before exiting after an error the daemon answers the requests it still holds; whatever is left, the kernel allows when the daemon's `fanotify` descriptor is closed, so `pacman` cannot hang because the daemon died. systemd restarts the service.
+- A malfunction while classifying a single request (for example an unreadable `/proc` entry) is logged and that request is let through without triggering `hm`; the daemon keeps running.
 
 ### Configuration
 
@@ -195,15 +196,17 @@ Environment="HELPERS_RE=yay|paru"
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HM` | `/usr/local/bin/hm` | Script to run |
-| `HM_TIMEOUT` | `30` | Seconds before `hm` is killed |
-| `COOLDOWN` | `60` | Minimum seconds between `hm` runs |
-| `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated) |
-| `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` |
-| `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation |
-| `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it. Replacements are normally detected immediately via inotify |
-| `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through |
-| `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped |
+| `HM` | `/usr/local/bin/hm` | Script to run (absolute path) |
+| `HM_TIMEOUT` | `30` | Seconds before `hm` is killed (> 0) |
+| `COOLDOWN` | `60` | Minimum seconds between `hm` runs (≥ 0) |
+| `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated, at least one) |
+| `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` (regular expression) |
+| `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation (regular expression) |
+| `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it (≥ 0). Replacements are normally detected immediately via inotify |
+| `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through (integer ≥ 1) |
+| `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped (≥ 0) |
+
+Numbers must be finite; a value that does not match its constraint makes the service fail to start with a message such as `invalid MAX_HELD='0': must be an integer >= 1`.
 
 ### Security
 
@@ -238,7 +241,13 @@ To follow the daemon logs in real time:
 journalctl -fu hm-daemon.service
 ```
 
-Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`), followed by `started`, the `hm` output and `releasing ... (hm exited with code N)`.
+Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`), followed by `started`, the `hm` output, `hm finished OK` or `hm FAILED (exit code N)`, and `releasing ... (hm exited with code N)`.
+
+Warnings and errors carry a journal priority, so problems can be listed directly:
+
+```bash
+journalctl -u hm-daemon.service -p warning   # hm failures, timeouts, hold limit, configuration and infrastructure errors
+```
 
 To see exactly what the service is allowed to do:
 
@@ -249,24 +258,27 @@ systemd-analyze security hm-daemon.service
 
 ## Tests
 
-`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instance (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
+`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
 
 ```bash
 ./test-hm-daemon.sh                      # uses ./hm-daemon
 ./test-hm-daemon.sh /path/to/hm-daemon
 ```
 
-The script re-runs itself with `sudo` (fanotify permission events need root). It needs `python3`, `awk`, `pkill`/`pgrep` (procps-ng), `timeout` and coreutils, plus a kernel with fanotify permission events.
+The script re-runs itself with `sudo` (fanotify permission events need root). It needs `python3`, `awk`, `pkill`/`pgrep` (procps-ng), `setsid` and `timeout` (util-linux, coreutils), plus a kernel with fanotify permission events.
 
 | # | What is checked |
 |---|---|
 | 1 | The mark follows a replaced file (`mv`, `sed -i`, `rm` + create, `ln -f`, in-place write): after each change a fake `pacman --sync` still triggers `hm` |
 | 2 | `SIGTERM` while a request is held: the request is released after `STOP_GRACE`, the daemon exits with code 0 and the stub `hm` is killed |
-| 3 | `SIGKILL` of the daemon while a request is held: the kernel lets the request through |
+| 3 | `SIGKILL` of the daemon while six requests are held: the kernel lets all of them through |
 | 4 | `MAX_HELD`: with a limit of 5, exactly 5 of 12 concurrent requests are held, the rest pass |
 | 5 | `hm` cannot be started: the request is not left blocked and the error is logged |
+| 6 | `hm` exceeds `HM_TIMEOUT` and has a child in another session: both are killed and the request is released |
+| 7 | Invalid configuration (`MAX_HELD=0`, `HM_TIMEOUT=nan`): the daemon exits with status 1 and names the variable |
+| 8 | A symlinked watch path with `RECHECK=0` produces a warning that replacement will not be detected |
 
-A successful run ends with `passed: 15, failed: 0` and exit status 0. Test 1 depends on timing (the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case of test 1 fails on a heavily loaded system, run the script again before investigating.
+A successful run ends with `passed: 23, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case fails on a heavily loaded system, run the script again before investigating.
 
 The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications, the systemd sandbox or the installers. Check those with:
 
