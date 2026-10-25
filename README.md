@@ -71,7 +71,10 @@ Environment="HELPERS_RE=yay|paru"
 | `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it. Replacements are normally detected immediately via inotify |
 | `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through |
 | `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped |
+
 ## Requirements
+
+All dependencies are already satisfied on a default CachyOS installation.
 
 `hm`:
 
