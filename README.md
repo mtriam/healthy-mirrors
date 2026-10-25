@@ -15,6 +15,9 @@ That's it! `hm-daemon` automatically checks mirror health before matching packag
 
 No aliases or wrappers are needed.
 
+Example output of hm:  
+![Example output of hm](docs/output.png)
+
 See [Usage](#usage) for manual operation and [hm-daemon](#hm-daemon) for details and configuration.
 
 ## What it does
