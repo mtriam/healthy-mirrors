@@ -162,9 +162,9 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 ### What triggers `hm`
 
-- `pacman` with a mirror-using operation: sync or upgrade (`-S*`, `-U`), or file-database refresh (`-Fy` / `--files --refresh`). Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
+- `pacman` with a mirror-using operation: sync (`-S*` / `--sync`), upgrade (`-U` / `--upgrade`) or a file-database refresh (`-F` together with `-y`, however spelled: `-Fy`, `-F -y`, `--files --refresh`, `--files -y`). Short options and the exact long names are recognized, also when a wrapper passes them separately or mixed; abbreviated long options (such as `--syn`) are not. Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
 - Processes whose name matches `SHELLY_RE` (default: `shelly.*`).
-- AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation.
+- AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation (recognized the same way as for `pacman`).
 
 ### Behavior
 

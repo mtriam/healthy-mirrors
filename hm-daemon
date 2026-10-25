@@ -171,16 +171,33 @@ def proc_info(pid):
         return "?", []
 
 
-def sync_ops(opts):
-    """True if the option list contains an operation that downloads from mirrors."""
+# Long names of the pacman options that matter here, mapped to their short form
+LONG_TO_SHORT = {"sync": "S", "upgrade": "U", "files": "F", "refresh": "y"}
+# Short options that take a value: the rest of a cluster such as "-b/some/path" belongs to the value
+SHORT_WITH_VALUE = "br"
+
+
+def pacman_flags(opts):
+    """Letters of the options given, as short options or as exact long names (--sync -> S)."""
+    flags = set()
     for a in opts:
-        if a in ("--sync", "--upgrade"):
-            return True
-        if not a.startswith("--") and re.search(r"[SU]", a):
-            return True
-        if not a.startswith("--") and "F" in a and "y" in a:      # pacman -Fy: refresh file databases
-            return True
-    return "--files" in opts and "--refresh" in opts
+        if a.startswith("--"):
+            short = LONG_TO_SHORT.get(a[2:].split("=", 1)[0])
+            if short:
+                flags.add(short)
+        else:
+            for ch in a[1:]:
+                if ch in SHORT_WITH_VALUE:
+                    break
+                flags.add(ch)
+    return flags
+
+
+def sync_ops(opts):
+    """True if the options contain an operation that downloads from mirrors: sync (-S / --sync),
+    upgrade (-U / --upgrade) or a file-database refresh (-F with -y / --refresh, in any combination)."""
+    flags = pacman_flags(opts)
+    return bool(flags & {"S", "U"}) or {"F", "y"} <= flags
 
 
 def should_trigger(comm, args):
