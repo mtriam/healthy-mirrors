@@ -3,10 +3,11 @@ set -o pipefail
 
 usage() {
     cat <<'EOF'
-Usage: hm [-c|--clean] [--notify-test]
+Usage: hm [-c|--clean] [--list] [--notify-test]
 
 Options:
   -c, --clean     strip the #UH# prefix from Server entries
+  --list          print the mirrorlist files hm manages (from pacman.conf) and exit
   --notify-test   send a test desktop notification and exit
   -h, --help      show this help message
 
@@ -18,10 +19,12 @@ EOF
 
 CLEAN=0
 NOTIFY_TEST=0
+LIST=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c|--clean)    CLEAN=1 ;;
+        --list)        LIST=1 ;;
         --notify-test) NOTIFY_TEST=1 ;;
         -h|--help)     usage; exit 0 ;;
         *)
@@ -33,10 +36,16 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
+if (( CLEAN + NOTIFY_TEST + LIST > 1 )); then
+    printf 'hm: --clean, --list and --notify-test cannot be combined\n' >&2
+    exit 1
+fi
+
 CACHYOS_API='https://dashboard.cachyos.org/api/v1/mirrors'
 ARCH_API='https://archlinux.org/mirrors/status/json/'
 MARK='#UH#'
 NOTIFY_MODE="${HM_NOTIFY:-auto}"
+[[ "$LIST" -eq 1 ]] && NOTIFY_MODE=never
 
 # ---------------------------------------------------------------------------
 # Temporary files
@@ -261,6 +270,12 @@ done < <(
 
 if [[ "${#MIRRORLISTS[@]}" -eq 0 ]]; then
     die 'no existing mirrorlist files found in /etc/pacman.conf'
+fi
+
+# --list: the single source of truth for which files hm updates (used by install-daemon.sh)
+if [[ "$LIST" -eq 1 ]]; then
+    printf '%s\n' "${MIRRORLISTS[@]}"
+    exit 0
 fi
 
 # ---------------------------------------------------------------------------

@@ -30,65 +30,9 @@ For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchr
 
 The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
 
-Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror. API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. If `hm` is killed in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
+Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror. API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
 
 After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list. If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
-
-## hm-daemon
-
-An optional systemd service that uses Linux fanotify to hold attempts to open `/etc/pacman.conf` (and other configured files). When a relevant process opens the file, the daemon runs `hm` first and releases the waiting `open()` once the script finishes, so the program reads the already updated mirror lists. No wrapper or alias is needed.
-
-**What triggers `hm`**
-
-- `pacman` with a mirror-using operation: sync or upgrade (`-S*`, `-U`), or file-database refresh (`-Fy` / `--files --refresh`). Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
-- Processes whose name matches `SHELLY_RE` (default: `shelly.*`).
-- AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation.
-
-**Behavior**
-
-- While `hm` is running, other processes opening the monitored files are held as well, so nothing reads the mirror lists before they are updated. From the user's side, `pacman` simply waits at startup without any message.
-- Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
-- A cooldown (default 60 s) prevents `hm` from running repeatedly.
-- `hm` is killed if it runs longer than the timeout (default 30 s).
-- If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check.
-- On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway. If `hm` does not finish in time, it and its child processes are killed.
-- At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors.
-- Unrecoverable `fanotify` errors make the daemon log the reason and exit with a non-zero status (systemd restarts it, and the kernel releases pending requests).
-
-
-- **If `hm` fails or times out, the waiting program is still released and continues with the existing mirror lists.**
-- If the daemon stops, the kernel releases all held requests, so `pacman` cannot hang permanently.
-
-**Security**
-
-The daemon runs as root and executes `/usr/local/bin/hm` as root. `hm` and its parent directories must be owned by root and not writable by group or others; `install-daemon.sh` checks this. The service is hardened (`ProtectSystem=strict`, `NoNewPrivileges`, a minimal capability set, and write access only to the directories of mirrorlists included from `pacman.conf`).
-Process names are not authenticated: any local process named `pacman` (or matching `SHELLY_RE`/`HELPERS_RE`) that opens `pacman.conf` with a sync operation can trigger `hm`, at most once per `COOLDOWN`. This gives no privileges, because `hm` takes no input from the triggering process, but it can delay other `pacman` runs for the duration of one `hm` run.
-
-**Configuration**
-
-Set environment variables with a systemd drop-in:
-
-```bash
-sudo systemctl edit hm-daemon.service
-```
-
-```ini
-[Service]
-Environment="COOLDOWN=600"
-Environment="HELPERS_RE=yay|paru"
-```
-
-| Variable | Default | Meaning |
-|---|---|---|
-| `HM` | `/usr/local/bin/hm` | Script to run |
-| `HM_TIMEOUT` | `30` | Seconds before `hm` is killed |
-| `COOLDOWN` | `60` | Minimum seconds between `hm` runs |
-| `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated) |
-| `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` |
-| `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation |
-| `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it. Replacements are normally detected immediately via inotify |
-| `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through |
-| `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped |
 
 ## Requirements
 
@@ -96,7 +40,7 @@ All dependencies are already satisfied on a default CachyOS installation.
 
 `hm`:
 
-- `bash`, `curl`, `jq`, `sed`, `grep`, `cmp`, `awk`, `mktemp`, `mv`, `cp`, `timeout`
+- `bash`, `curl`, `jq`, `sed`, `grep`, `awk`, `cmp`, `mktemp`, `mv`, `cp`, `timeout`
 - `sudo` (only when mirrorlist files need to be updated and you are not root)
 
 `hm-daemon` (optional):
@@ -105,14 +49,9 @@ All dependencies are already satisfied on a default CachyOS installation.
 - `python3`
 - a kernel with fanotify permission events (`CONFIG_FANOTIFY_ACCESS_PERMISSIONS`)
 
-## Error notifications
+Desktop notifications on errors (optional): `notify-send` (`libnotify`), `setpriv` and `loginctl` (`util-linux`, `systemd`), and a running notification daemon in your session.
 
-When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable API responses, failed `sudo` authentication and repositories without any active mirror. In a terminal the error is printed as usual and no notification is sent.
-
-- When run as root (by the daemon), `hm` notifies every active user session via `notify-send`, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
-- Requires `notify-send` (`libnotify`), `setpriv` and `loginctl` (`util-linux`, `systemd`), and a running notification daemon in the user session.
-- To allow this, the service unit uses `ProtectHome=read-only` (instead of `yes`) and additionally keeps `CAP_SETUID` and `CAP_SETGID`.
-- Control: `HM_NOTIFY=auto|always|never` (default `auto`). Send a test notification with `hm --notify-test`.
+The installers additionally use `install`, `stat` and `readlink` (coreutils); `pacman-conf` and `systemd-analyze` are used when available.
 
 ## Install
 
@@ -123,7 +62,18 @@ cd healthy-mirrors
 ./install-daemon.sh   # optional: installs and starts hm-daemon.service
 ```
 
-Both installers use only files from the local checkout; they never download executable files. `install-daemon.sh` requires `hm` to be already installed in `/usr/local/bin`, validates the local daemon source as Python, and checks that `hm` and every path component up to `/` are root-owned and not group/world-writable. It can be run again to update the service. Use `SRC=/path/to/hm-daemon ./install-daemon.sh` to install a daemon from another local path.
+Both installers use only files from the local checkout; they never download anything. Because the installed files run as root, they:
+
+- refuse a source file that is not owned by root or by the user who ran `sudo`, or that is world-writable (group-writable only produces a warning),
+- copy the file into a root-only staging directory under `/run`, validate that exact copy, install it atomically and verify the result.
+
+`install-daemon.sh` additionally:
+
+- requires `hm` to be installed already (run `./install.sh` first) and checks that `hm` and every path component up to `/` are root-owned, not symlinks and not group/world-writable,
+- asks `hm --list` which mirrorlists exist, so that `hm` and the service sandbox agree on the writable directories,
+- generates the hardened unit and **restores the previous version if the new service does not start** (it must stay up for 2 seconds without a restart).
+
+Use `SRC=/path/to/file ./install.sh` or `SRC=/path/to/hm-daemon ./install-daemon.sh` to install from another local path.
 
 ## Update
 
@@ -134,8 +84,8 @@ git pull --ff-only
 ./install-daemon.sh   # optional: updates and restarts hm-daemon.service
 ```
 
-- `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755`.
-- `install-daemon.sh` can be run repeatedly. It replaces `/usr/local/bin/hm-daemon`, regenerates the service unit using the resolved `Include` directories as writable paths, and restarts the service.
+- `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755` and can be run repeatedly.
+- `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`) are kept.
 
@@ -151,51 +101,9 @@ sudo rm /usr/local/bin/hm
 
 `--remove` stops and removes `hm-daemon.service` and `/usr/local/bin/hm-daemon`. A drop-in created with `systemctl edit` is left in `/etc/systemd/system/hm-daemon.service.d/`; remove it manually if needed.
 
-## Diagnostics
-
-To follow the daemon logs in real time:
-
-```bash
-journalctl -fu hm-daemon.service
-```
-
-Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`).
-
-## Tests
-
-`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instance (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
-
-```bash
-./test-hm-daemon.sh                      # uses ./hm-daemon
-./test-hm-daemon.sh /path/to/hm-daemon
-```
-
-The script re-runs itself with `sudo` (fanotify permission events need root). It needs `python3`, `awk`, `pkill`/`pgrep` (procps-ng), `timeout` and coreutils, plus a kernel with fanotify permission events.
-
-| # | What is checked |
-|---|---|
-| 1 | The mark follows a replaced file (`mv`, `sed -i`, `rm` + create, `ln -f`, in-place write): after each change a fake `pacman --sync` still triggers `hm` |
-| 2 | `SIGTERM` while a request is held: the request is released after `STOP_GRACE`, the daemon exits with code 0 and the stub `hm` is killed |
-| 3 | `SIGKILL` of the daemon while a request is held: the kernel lets the request through |
-| 4 | `MAX_HELD`: with a limit of 5, exactly 5 of 12 concurrent requests are held, the rest pass |
-| 5 | `hm` cannot be started: the request is not left blocked and the error is logged |
-
-A successful run ends with `passed: 15, failed: 0` and exit status 0. Test 1 depends on timing (the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case of test 1 fails on a heavily loaded system, run the script again before investigating.
-
-The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications or the systemd sandbox. Check those with:
-
-```bash
-hm --notify-test                  # notification path of a regular user
-sudo hm                           # real run; then: grep -c '^#UH#' /etc/pacman.d/*mirrorlist*
-sudo hm --clean                   # removes the markers again
-journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Ss foo`
-```
-
 ## Usage
 
-**If the daemon is installed and running, no additional action is needed.**
-
-It runs `hm` automatically before matching programs read `pacman.conf` and the mirror lists.
+**If the daemon is installed and running, no additional action is needed.** It runs `hm` automatically before matching programs read `pacman.conf` and the mirror lists.
 
 ### Manual use
 
@@ -205,21 +113,16 @@ Without the daemon, run `hm` manually before using the mirror lists, or use the 
 hm
 ```
 
-To remove the `#UH#` markers added by `hm`:
+| Option | Meaning |
+|---|---|
+| `-c`, `--clean` | Remove the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files |
+| `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Mirrorlists that are symlinks are not supported by `hm` |
+| `--notify-test` | Send a test desktop notification and exit |
+| `-h`, `--help` | Show the help message |
 
-```bash
-hm --clean
-```
+`--clean`, `--list` and `--notify-test` cannot be combined. Set `HM_NOTIFY=auto|always|never` to control desktop notifications on errors (default `auto`, see [Error notifications](#error-notifications)).
 
-or:
-
-```bash
-hm -c
-```
-
-The `-c` / `--clean` option removes only the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files.
-
-Both modes compare the generated result with the current file before writing changes, so an unchanged run does not ask for `sudo`.
+Both `hm` and `hm --clean` compare the generated result with the current file before writing changes, so an unchanged run does not ask for `sudo`.
 
 ### Shell function: `up`
 
@@ -252,3 +155,149 @@ Install a package while upgrading the system:
 ```bash
 up firefox
 ```
+
+## hm-daemon
+
+An optional systemd service that uses Linux fanotify to hold attempts to open `/etc/pacman.conf` (and other configured files). When a relevant process opens the file, the daemon runs `hm` first and releases the waiting `open()` once the script finishes, so the program reads the already updated mirror lists. No wrapper or alias is needed.
+
+### What triggers `hm`
+
+- `pacman` with a mirror-using operation: sync or upgrade (`-S*`, `-U`), or file-database refresh (`-Fy` / `--files --refresh`). Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
+- Processes whose name matches `SHELLY_RE` (default: `shelly.*`).
+- AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation.
+
+### Behavior
+
+- While `hm` is running, other processes opening the monitored files are held as well, so nothing reads the mirror lists before they are updated. From the user's side, `pacman` simply waits at startup without any message.
+- Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
+- A cooldown (default 60 s) prevents `hm` from running repeatedly. It also applies after a failed or timed-out run.
+- `hm` is killed (together with its child processes) if it runs longer than the timeout (default 30 s).
+- **If `hm` fails or times out, the waiting program is still released and continues with the existing mirror lists.**
+- If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check.
+- On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway.
+- At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors.
+- Unrecoverable `fanotify` errors make the daemon log the reason and exit with a non-zero status (systemd restarts it).
+- If the daemon dies or is killed, the kernel releases all held requests, so `pacman` cannot hang permanently.
+
+### Configuration
+
+Set environment variables with a systemd drop-in:
+
+```bash
+sudo systemctl edit hm-daemon.service
+```
+
+```ini
+[Service]
+Environment="COOLDOWN=600"
+Environment="HELPERS_RE=yay|paru"
+```
+
+| Variable | Default | Meaning |
+|---|---|---|
+| `HM` | `/usr/local/bin/hm` | Script to run |
+| `HM_TIMEOUT` | `30` | Seconds before `hm` is killed |
+| `COOLDOWN` | `60` | Minimum seconds between `hm` runs |
+| `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated) |
+| `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` |
+| `HELPERS_RE` | `yay\|paru\|pikaur\|trizen\|octopi` | AUR helpers and frontends that trigger `hm` when run bare or with a sync/upgrade operation |
+| `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it. Replacements are normally detected immediately via inotify |
+| `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through |
+| `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped |
+
+### Security
+
+The daemon runs as root and executes `/usr/local/bin/hm` as root. `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `install-daemon.sh` checks this when installing.
+
+The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The generated unit (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
+
+Capabilities are limited to three, all verified to be necessary:
+
+| Capability | Why |
+|---|---|
+| `CAP_SYS_ADMIN` | `fanotify_init` with permission events (without it: `fanotify_init: Operation not permitted`) |
+| `CAP_SETUID`, `CAP_SETGID` | `hm` switches to the logged-in user with `setpriv` to show desktop notifications (without them `setpriv` fails) |
+
+`Restart=always` keeps the guard running if it is killed; `StartLimitBurst=5` within 60 s turns a permanent startup error into a visible failed state.
+
+Process names are not authenticated: any local process named `pacman` (or matching `SHELLY_RE`/`HELPERS_RE`) that opens `pacman.conf` with a sync operation can trigger `hm`, at most once per `COOLDOWN`. This gives no privileges, because `hm` takes no input from the triggering process, but it can delay other `pacman` runs for the duration of one `hm` run.
+
+## Error notifications
+
+When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable API responses, failed `sudo` authentication and repositories without any active mirror. In a terminal the error is printed as usual and no notification is sent.
+
+- When run as a regular user, `hm` calls `notify-send` directly.
+- When run as root (by the daemon), `hm` notifies every active user session, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
+- Control: `HM_NOTIFY=auto|always|never` (default `auto`). Send a test notification with `hm --notify-test`.
+
+## Diagnostics
+
+To follow the daemon logs in real time:
+
+```bash
+journalctl -fu hm-daemon.service
+```
+
+Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`), followed by `started`, the `hm` output and `releasing ... (hm exited with code N)`.
+
+To see exactly what the service is allowed to do:
+
+```bash
+systemctl show hm-daemon.service -p ReadWritePaths -p ReadOnlyPaths -p CapabilityBoundingSet
+systemd-analyze security hm-daemon.service
+```
+
+## Tests
+
+`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instance (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
+
+```bash
+./test-hm-daemon.sh                      # uses ./hm-daemon
+./test-hm-daemon.sh /path/to/hm-daemon
+```
+
+The script re-runs itself with `sudo` (fanotify permission events need root). It needs `python3`, `awk`, `pkill`/`pgrep` (procps-ng), `timeout` and coreutils, plus a kernel with fanotify permission events.
+
+| # | What is checked |
+|---|---|
+| 1 | The mark follows a replaced file (`mv`, `sed -i`, `rm` + create, `ln -f`, in-place write): after each change a fake `pacman --sync` still triggers `hm` |
+| 2 | `SIGTERM` while a request is held: the request is released after `STOP_GRACE`, the daemon exits with code 0 and the stub `hm` is killed |
+| 3 | `SIGKILL` of the daemon while a request is held: the kernel lets the request through |
+| 4 | `MAX_HELD`: with a limit of 5, exactly 5 of 12 concurrent requests are held, the rest pass |
+| 5 | `hm` cannot be started: the request is not left blocked and the error is logged |
+
+A successful run ends with `passed: 15, failed: 0` and exit status 0. Test 1 depends on timing (the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case of test 1 fails on a heavily loaded system, run the script again before investigating.
+
+The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications, the systemd sandbox or the installers. Check those with:
+
+```bash
+hm --notify-test                  # notification path of a regular user
+sudo hm                           # real run; then: grep -c '^#UH#' /etc/pacman.d/*mirrorlist*
+sudo hm --clean                   # removes the markers again
+journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Ss foo`
+```
+
+Installer rollback (installs a deliberately broken daemon and checks that the previous version returns):
+
+```bash
+{ head -n1 hm-daemon; echo 'raise SystemExit(3)'; tail -n +2 hm-daemon; } > /tmp/hm-daemon-broken
+SRC=/tmp/hm-daemon-broken ./install-daemon.sh; echo "exit=$?"   # expected: update rolled back, exit=1
+systemctl is-active hm-daemon.service                           # expected: active (previous version)
+cmp hm-daemon /usr/local/bin/hm-daemon && echo "previous version restored"
+rm -f /tmp/hm-daemon-broken
+```
+
+## Repository files
+
+| File | Purpose |
+|---|---|
+| `hm` | The mirror health check |
+| `hm-daemon` | The optional fanotify service that runs `hm` before `pacman`/`shelly` read the mirror lists |
+| `install.sh` | Installs `hm` to `/usr/local/bin` |
+| `install-daemon.sh` | Installs, updates (with rollback) or removes (`--remove`) the hardened `hm-daemon.service` |
+| `test-hm-daemon.sh` | Tests for the daemon |
+| `docs/` | Images used in this README |
+
+## License
+
+See [LICENSE](LICENSE).
