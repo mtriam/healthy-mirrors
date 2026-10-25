@@ -2,6 +2,21 @@
 
 Checks mirror health and automatically keeps only healthy mirrors active, reducing the risk of partial upgrades caused by mirrors that are out of sync.
 
+## Quick start
+
+Install `hm` and enable automatic mirror checks:
+
+```bash
+git clone https://github.com/mtriam/healthy-mirrors.git
+cd healthy-mirrors && ./install.sh && ./install-daemon.sh
+```
+
+That's it! `hm-daemon` automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades.
+
+No aliases or wrappers are needed.
+
+See [Usage](#usage) for manual operation and [hm-daemon](#hm-daemon) for details and configuration.
+
 ## What it does
 
 The `hm` script reads existing mirror-list files included via `/etc/pacman.conf` (including ordinary shell-glob patterns) and checks the current CachyOS and Arch Linux mirror status using their respective APIs. Non-absolute or missing `Include` entries are skipped; if no existing mirror-list file is found, the script fails.
