@@ -30,9 +30,11 @@ For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchr
 
 The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
 
-Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror, so a failed run leaves the mirrorlists as they were (never half-written). API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain and can be removed manually.
+Only mirrors that the APIs know are ever disabled: a mirror is commented out when the API lists it and reports it as unhealthy. Mirrors the APIs do not list at all (a local cache, your own server, a company mirror, ...) are left exactly as they are and count as active in the summary. For example, on CachyOS the `cachyos-rate-mirrors` tool typically puts `https://archlinux.cachyos.org/repo/$repo/os/$arch` at the top of `/etc/pacman.d/mirrorlist`; the Arch mirror status API does not list it, so `hm` keeps it and the Arch list is summarized as `, 1 other`. `hm` cannot judge such mirrors: if one of them is unreachable from your location, remove it from the list yourself. Side effect: a mirror that has been removed from the API, or a variant of a mirror (for example `http://`) that the API does not list, also stays active.
 
-After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list. If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
+Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror, so a failed run leaves the mirrorlists as they were (never half-written). API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain. `hm` removes `.hm-stage.*` files older than one day (as root on every run, as a regular user whenever it writes anyway); `.hm-backup.*` files are never removed automatically, because after a failed rollback a backup may be the only intact copy.
+
+After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list (`on/off`); when mirrors unknown to the APIs were left untouched, their number is added as `, N other` (they are included in `on`). If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
 
 ## Requirements
 
@@ -40,7 +42,7 @@ All dependencies are already satisfied on a default CachyOS installation.
 
 `hm`:
 
-- `bash`, `curl`, `jq`, `sed`, `grep`, `awk`, `cmp`, `mktemp`, `mv`, `cp`, `timeout`
+- `bash`, `curl`, `jq`, `sed`, `grep`, `awk`, `cmp`, `find`, `mktemp`, `mv`, `cp`, `timeout`
 - `sudo` (only when mirrorlist files need to be updated and you are not root)
 
 `hm-daemon` (optional):
@@ -116,13 +118,25 @@ hm
 | Option | Meaning |
 |---|---|
 | `-c`, `--clean` | Remove the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files |
+| `-n`, `--dry-run` | Show what would change (which mirrors would be disabled or enabled, which stale staging files removed, which mirrors are left as they are because the APIs do not know them) and the resulting summary, but write nothing and do not ask for `sudo`. Works together with `--clean` |
 | `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Mirrorlists that are symlinks are not supported by `hm` |
 | `--notify-test` | Send a test desktop notification and exit |
 | `-h`, `--help` | Show the help message |
 
-`--clean`, `--list` and `--notify-test` cannot be combined. Set `HM_NOTIFY=auto|always|never` to control desktop notifications on errors (default `auto`, see [Error notifications](#error-notifications)).
+`--list` and `--notify-test` cannot be combined with other options; `--dry-run` can be combined with `--clean`. Set `HM_NOTIFY=auto|always|never` to control desktop notifications on errors (default `auto`, see [Error notifications](#error-notifications); notifications are always off with `--dry-run` and `--list`).
 
 Both `hm` and `hm --clean` compare the generated result with the current file before writing changes, so an unchanged run does not ask for `sudo`.
+
+Example of a dry run:
+
+```text
+$ hm --dry-run
+==== dry run: nothing is written ====
+hm: would update /etc/pacman.d/cachyos-mirrorlist
+    disable  https://mirror.example.org/cachyos/repo/$arch/$repo
+hm: left as it is (not known to the API): /etc/pacman.d/mirrorlist: https://archlinux.cachyos.org/repo/$repo/os/$arch
+==== mirror summary (on/off): cachyos-v4 (3/1) | cachyos (3/1) | arch (3/0, 1 other) ====
+```
 
 ### Shell function: `up`
 
@@ -171,6 +185,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - While `hm` is running, other processes opening the monitored files are held as well, so nothing reads the mirror lists before they are updated. From the user's side, `pacman` simply waits at startup without any message.
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly. It also applies after a failed or timed-out run.
+- All intervals (cooldown, `hm` timeout, stop grace period, periodic check) use the monotonic clock, so a change of the system time (NTP correction after boot, resume from suspend) cannot shorten or extend them.
 - **The daemon guarantees a check before the operation, not that the check succeeds.** If `hm` fails or times out, the waiting programs are still released and continue with the existing mirror lists. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run), shows a desktop notification, and the daemon logs `hm FAILED (exit code N)` or `hm TIMED OUT` at error priority.
 - On timeout (default 30 s) `hm` is killed together with its child processes. Children are found through their parent links, also when they moved to another session or process group; a process that detaches completely from `hm`'s process tree (double fork) is not tracked, which `hm` never does.
 - If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check (and not at all with `RECHECK=0`).
@@ -231,7 +246,7 @@ When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybin
 
 - When run as a regular user, `hm` calls `notify-send` directly.
 - When run as root (by the daemon), `hm` notifies every active user session, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
-- Control: `HM_NOTIFY=auto|always|never` (default `auto`). Send a test notification with `hm --notify-test`.
+- Control: `HM_NOTIFY=auto|always|never` (default `auto`). Notifications are always off with `--dry-run` and `--list`. Send a test notification with `hm --notify-test`.
 
 ## Diagnostics
 
@@ -241,7 +256,7 @@ To follow the daemon logs in real time:
 journalctl -fu hm-daemon.service
 ```
 
-Each `open()` is logged with the process name, command line and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`), followed by `started`, the `hm` output, `hm finished OK` or `hm FAILED (exit code N)`, and `releasing ... (hm exited with code N)`.
+Each `open()` is logged with the process name and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`). The command line is logged only for `pacman`, AUR helpers and `shelly`; any other process that opens the file is logged by name only and its command line is not even read. A triggering open is followed by `started`, the `hm` output, `hm finished OK` or `hm FAILED (exit code N)`, and `releasing ... (hm exited with code N)`.
 
 Warnings and errors carry a journal priority, so problems can be listed directly:
 
@@ -283,6 +298,7 @@ A successful run ends with `passed: 23, failed: 0` and exit status 0. Tests 1, 2
 The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications, the systemd sandbox or the installers. Check those with:
 
 ```bash
+hm --dry-run                      # what a run would change, nothing is written
 hm --notify-test                  # notification path of a regular user
 sudo hm                           # real run; then: grep -c '^#UH#' /etc/pacman.d/*mirrorlist*
 sudo hm --clean                   # removes the markers again

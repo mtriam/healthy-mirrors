@@ -6,6 +6,9 @@ fanotify permission events are tied to an inode. When a watched file is replaced
 inotify watch on the parent directory re-marks the new file immediately. A slow
 periodic check (RECHECK) is kept as a safety net.
 
+All intervals (cooldown, timeouts, grace period, periodic check) use the monotonic
+clock, so changes of the system time cannot shorten or extend them.
+
 Exit status: 0 after a requested stop, 1 for invalid configuration or an
 infrastructure error, 2 for an unexpected internal error (the traceback is logged).
 Whatever the reason, the kernel allows all outstanding permission requests when the
@@ -160,15 +163,26 @@ def printable(s):
     return "".join(c if c.isprintable() else "?" for c in s)
 
 
-def proc_info(pid):
+def proc_comm(pid):
     try:
         with open(f"/proc/{pid}/comm") as f:
-            comm = printable(f.read().strip())
-        with open(f"/proc/{pid}/cmdline", "rb") as f:
-            args = [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
-        return comm, args
+            return printable(f.read().strip())
     except Exception:
-        return "?", []
+        return "?"
+
+
+def proc_args(pid):
+    try:
+        with open(f"/proc/{pid}/cmdline", "rb") as f:
+            return [a.decode(errors="replace") for a in f.read().split(b"\0") if a]
+    except Exception:
+        return []
+
+
+def is_client(comm):
+    """Programs we care about: pacman, AUR helpers, shelly. Only for these the command line
+    is read and logged; every other process that opens the file is logged by name only."""
+    return comm == "pacman" or bool(HELPERS_RE.fullmatch(comm)) or bool(SHELLY_RE.fullmatch(comm))
 
 
 # Long names of the pacman options that matter here, mapped to their short form
@@ -203,7 +217,7 @@ def sync_ops(opts):
 def should_trigger(comm, args):
     opts = [a for a in args[1:] if a.startswith("-")]
     if comm == "pacman":
-        # only operations that use mirrors: -S*, -U, -Fy (not -Q, -T, -V, ...)
+        # only operations that use mirrors: sync, upgrade, file-database refresh (not -Q, -T, -V, ...)
         return sync_ops(opts)
     if HELPERS_RE.fullmatch(comm):
         # no options = interactive search/install by name; otherwise only sync/upgrade
@@ -340,10 +354,11 @@ def run():
     log(f"watching open() on: {WATCH}")
 
     held, hm = [], None
-    t0 = last = 0.0
+    t0 = 0.0
+    last = -math.inf                      # no hm run yet: the cooldown is not active
     limit_logged = False
     stopping, stop_deadline = False, 0.0
-    next_check = time.time() + RECHECK if RECHECK > 0 else None
+    next_check = time.monotonic() + RECHECK if RECHECK > 0 else None
     me = os.getpid()
 
     def allow(fd):
@@ -362,7 +377,7 @@ def run():
         """Answer every held request, one by one (a failure leaves the rest in `held`)."""
         nonlocal hm, last
         log(f"releasing {len(held)} held open() calls ({reason})")
-        hm, last = None, time.time()
+        hm, last = None, time.monotonic()
         while held:
             allow(held.pop(0))
 
@@ -404,9 +419,9 @@ def run():
         while True:
             if STOP and not stopping:
                 stopping = True
-                stop_deadline = time.time() + STOP_GRACE
+                stop_deadline = time.monotonic() + STOP_GRACE
                 log("stop requested" + (f", letting hm finish (up to {STOP_GRACE:g} s)" if hm else ""))
-            if stopping and (hm is None or time.time() > stop_deadline):
+            if stopping and (hm is None or time.monotonic() > stop_deadline):
                 if hm is not None:
                     stop_hm("hm did not finish within the stop grace period", WARN)
                 break
@@ -414,7 +429,7 @@ def run():
             if hm:
                 timeout = 0.2
             elif next_check is not None:
-                timeout = max(0.0, next_check - time.time())
+                timeout = max(0.0, next_check - time.monotonic())
             else:
                 timeout = None
             r, _, _ = select.select([fan, ino, sig_r], [], [], timeout)
@@ -456,24 +471,26 @@ def run():
                             held.append(fd)              # hm running: hold further openers
                     else:
                         try:
-                            comm, args = proc_info(pid)
+                            comm = proc_comm(pid)
+                            client = is_client(comm)
+                            args = proc_args(pid) if client else []    # other processes: name only
                             ok = should_trigger(comm, args)
                         except Exception as e:           # a bug in classification must not take the daemon down
                             log(f"cannot classify pid={pid}: {e!r}; letting it through", WARN)
-                            comm, args, ok = "?", [], False
-                        cool = time.time() - last < COOLDOWN
-                        log(f"open pid={pid} comm={comm} cmd={' '.join(args)[:100]!r} "
-                            f"trigger={ok} cooldown={cool}")
+                            comm, args, client, ok = "?", [], False, False
+                        cool = time.monotonic() - last < COOLDOWN
+                        cmd = f" cmd={' '.join(args)[:100]!r}" if client else ""
+                        log(f"open pid={pid} comm={comm}{cmd} trigger={ok} cooldown={cool}")
                         if ok and not cool:
                             try:
                                 hm = subprocess.Popen([HM], stdin=subprocess.DEVNULL,
                                                       start_new_session=True)
                             except OSError as e:
                                 log(f"cannot start {HM}: {e}", ERR)
-                                last = time.time()       # do not retry on every open
+                                last = time.monotonic()  # do not retry on every open
                                 allow(fd)
                             else:
-                                t0 = time.time()
+                                t0 = time.monotonic()
                                 limit_logged = False
                                 held.append(fd)
                                 log(f"started {HM} (pid {hm.pid})")
@@ -489,11 +506,11 @@ def run():
                         log(f"hm FAILED (exit code {rc}); held programs continue with the "
                             f"existing mirror lists", ERR)
                     release(f"hm exited with code {rc}")
-                elif time.time() - t0 > HM_TIMEOUT:
+                elif time.monotonic() - t0 > HM_TIMEOUT:
                     stop_hm(f"hm timed out after {HM_TIMEOUT:g} s")
-            elif next_check is not None and time.time() >= next_check:
+            elif next_check is not None and time.monotonic() >= next_check:
                 resync("periodic")
-                next_check = time.time() + RECHECK
+                next_check = time.monotonic() + RECHECK
 
         if held:
             release("shutdown")

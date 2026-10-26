@@ -3,10 +3,11 @@ set -o pipefail
 
 usage() {
     cat <<'EOF'
-Usage: hm [-c|--clean] [--list] [--notify-test]
+Usage: hm [-c|--clean] [-n|--dry-run] [--list] [--notify-test]
 
 Options:
   -c, --clean     strip the #UH# prefix from Server entries
+  -n, --dry-run   show what would change and write nothing (also works with --clean)
   --list          print the mirrorlist files hm manages (from pacman.conf) and exit
   --notify-test   send a test desktop notification and exit
   -h, --help      show this help message
@@ -18,12 +19,14 @@ EOF
 }
 
 CLEAN=0
+DRY_RUN=0
 NOTIFY_TEST=0
 LIST=0
 
 while [[ $# -gt 0 ]]; do
     case "$1" in
         -c|--clean)    CLEAN=1 ;;
+        -n|--dry-run)  DRY_RUN=1 ;;
         --list)        LIST=1 ;;
         --notify-test) NOTIFY_TEST=1 ;;
         -h|--help)     usage; exit 0 ;;
@@ -36,16 +39,17 @@ while [[ $# -gt 0 ]]; do
     shift
 done
 
-if (( CLEAN + NOTIFY_TEST + LIST > 1 )); then
-    printf 'hm: --clean, --list and --notify-test cannot be combined\n' >&2
+if (( LIST + NOTIFY_TEST > 1 )) || { (( LIST + NOTIFY_TEST == 1 )) && (( CLEAN + DRY_RUN > 0 )); }; then
+    printf 'hm: --list and --notify-test cannot be combined with other options\n' >&2
     exit 1
 fi
 
 CACHYOS_API='https://dashboard.cachyos.org/api/v1/mirrors'
 ARCH_API='https://archlinux.org/mirrors/status/json/'
 MARK='#UH#'
+STALE_MINUTES=1440      # staging files older than this are leftovers of a killed update
 NOTIFY_MODE="${HM_NOTIFY:-auto}"
-[[ "$LIST" -eq 1 ]] && NOTIFY_MODE=never
+[[ "$LIST" -eq 1 || "$DRY_RUN" -eq 1 ]] && NOTIFY_MODE=never
 
 # ---------------------------------------------------------------------------
 # Temporary files
@@ -54,6 +58,7 @@ NOTIFY_MODE="${HM_NOTIFY:-auto}"
 declare -a TEMPFILES=()
 declare -a TARGETS=()
 declare -a CANDIDATES=()
+declare -a OTHER_SERVERS=()
 
 NEW_TEMP_PATH=''
 
@@ -278,6 +283,18 @@ if [[ "$LIST" -eq 1 ]]; then
     exit 0
 fi
 
+# directories of the managed mirrorlists (where staging files are created)
+declare -a MIRRORLIST_DIRS=()
+declare -A SEEN_DIRS=()
+for mirrorlist in "${MIRRORLISTS[@]}"; do
+    dir="${mirrorlist%/*}"
+    [[ -n "$dir" ]] || dir=/
+    if [[ -z "${SEEN_DIRS[$dir]:-}" ]]; then
+        SEEN_DIRS[$dir]=1
+        MIRRORLIST_DIRS+=("$dir")
+    fi
+done
+
 # ---------------------------------------------------------------------------
 # Colors
 # ---------------------------------------------------------------------------
@@ -295,12 +312,82 @@ fi
 WARNING_STYLE="$RED"
 
 # ---------------------------------------------------------------------------
+# Stale staging files
+#
+# Only .hm-stage.* older than STALE_MINUTES: they are copies that were never
+# committed. .hm-backup.* files are never removed automatically, because after
+# a failed rollback a backup may be the only intact copy.
+# ---------------------------------------------------------------------------
+
+stale_stage_files() {
+    local dir
+    for dir in "${MIRRORLIST_DIRS[@]}"; do
+        find "$dir" -maxdepth 1 -type f -name '.hm-stage.*' -mmin +"$STALE_MINUTES" -print 2>/dev/null
+    done
+}
+
+remove_stale_stage_files() {
+    local f removed=0
+
+    while IFS= read -r f; do
+        [[ -n "$f" ]] || continue
+        run_priv rm -f -- "$f" && removed=$((removed + 1))
+    done < <(stale_stage_files)
+
+    if [[ "$removed" -gt 0 ]]; then
+        printf 'hm: removed %d stale staging file(s) older than one day\n' "$removed" >&2
+    fi
+    return 0
+}
+
+# ---------------------------------------------------------------------------
+# Dry run: describe what would be written
+# ---------------------------------------------------------------------------
+
+describe_changes() {   # $1 = current file, $2 = candidate file (same lines, only markers differ)
+    awk '
+        NR == FNR { cur[FNR] = $0; next }
+        cur[FNR] != $0 {
+            if (index($0, "#UH#Server = ") == 1)              print "    disable  " substr($0, 14)
+            else if (index(cur[FNR], "#UH#Server = ") == 1)   print "    enable   " substr($0, 10)
+            else                                              print "    change   " $0
+        }
+    ' "$1" "$2"
+}
+
+report_pending() {
+    local i f
+
+    printf '==== dry run: nothing is written ====\n'
+
+    if [[ "${#TARGETS[@]}" -eq 0 ]]; then
+        printf 'hm: no mirrorlist would change\n'
+    else
+        for i in "${!TARGETS[@]}"; do
+            printf 'hm: would update %s\n' "${TARGETS[$i]}"
+            describe_changes "${TARGETS[$i]}" "${CANDIDATES[$i]}"
+        done
+    fi
+
+    for f in "${OTHER_SERVERS[@]}"; do
+      printf 'hm: left as it is (not known to the API): %s\n' "$f"
+    done
+
+    while IFS= read -r f; do
+      [[ -n "$f" ]] && printf 'hm: would remove stale staging file %s\n' "$f"
+    done < <(stale_stage_files)
+
+return 0
+}
+
+# ---------------------------------------------------------------------------
 # Transactional replacement
 #
 # Prepare every staged file and backup before replacing any target.
 # Each individual rename is atomic. If a later rename fails, roll back
 # previously committed files. Backups are created alongside their targets.
-# (Authentication and termination deferral are handled by commit_changes.)
+# (Authentication, stale-file cleanup and termination deferral are handled by
+# commit_changes.)
 # ---------------------------------------------------------------------------
 
 transactional_commit() {
@@ -425,12 +512,16 @@ transactional_commit() {
     return 0
 }
 
-# Authenticate once (may prompt), then run the replacement with termination
-# deferred, so it always ends in a consistent state.
+# Authenticate once (may prompt), remove stale staging files, then run the
+# replacement with termination deferred, so it always ends in a consistent state.
 commit_changes() {
     local rc
 
-    [[ "${#TARGETS[@]}" -gt 0 ]] || return 0
+    # Nothing to write: only root cleans up on its own, a regular user must not be
+    # asked for sudo just for that.
+    if [[ "${#TARGETS[@]}" -eq 0 && "$EUID" -ne 0 ]]; then
+        return 0
+    fi
 
     if [[ "$EUID" -ne 0 ]]; then
         sudo -v || {
@@ -438,6 +529,10 @@ commit_changes() {
             return 1
         }
     fi
+
+    remove_stale_stage_files
+
+    [[ "${#TARGETS[@]}" -gt 0 ]] || return 0
 
     defer_termination
     transactional_commit
@@ -473,7 +568,11 @@ if [[ "$CLEAN" -eq 1 ]]; then
         fi
     done
 
-    commit_changes || die 'clean operation failed; check the errors above'
+    if [[ "$DRY_RUN" -eq 1 ]]; then
+        report_pending
+    else
+        commit_changes || die 'clean operation failed; check the errors above'
+    fi
 
     exit 0
 fi
@@ -496,6 +595,10 @@ new_temp || die 'cannot create temporary file'
 TMP_V4=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
 ARCH_MIRRORS=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+KNOWN_CACHYOS=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+KNOWN_ARCH=$NEW_TEMP_PATH
 
 curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" -o "$JSON_CACHYOS" ||
     die 'cannot download CachyOS mirror status'
@@ -534,6 +637,29 @@ validate_urls() {
 
     return 0
 }
+
+# ---------------------------------------------------------------------------
+# Known mirrors: every mirror the APIs list, healthy or not. A mirror that is
+# not known (local cache, own server, company mirror, ...) is never touched.
+# ---------------------------------------------------------------------------
+
+jq -r '
+    .mirrors[]
+    | select(.url | type == "string")
+    | .url
+    | sub("/+$"; "")
+    | select(test("^[^[:cntrl:]]+$"))
+' "$JSON_CACHYOS" > "$KNOWN_CACHYOS" ||
+    die 'cannot parse CachyOS mirror list'
+
+jq -r '
+    .urls[]
+    | select(.url | type == "string")
+    | .url
+    | sub("/+$"; "")
+    | select(test("^[^[:cntrl:]]+$"))
+' "$JSON_ARCH" > "$KNOWN_ARCH" ||
+    die 'cannot parse Arch Linux mirror list'
 
 # ---------------------------------------------------------------------------
 # CachyOS health lists
@@ -594,6 +720,20 @@ validate_urls "$ARCH_MIRRORS" ||
 # Build and validate all candidates before touching any mirrorlist.
 # ---------------------------------------------------------------------------
 
+# True if the Server value ($1) starts with one of the URLs given as the remaining arguments.
+matches_any() {
+    local server="$1" url
+    shift
+
+    for url in "$@"; do
+        [[ -n "$url" ]] || continue
+        if [[ "$server" == "$url/"* || "$server" == "$url" ]]; then
+            return 0
+        fi
+    done
+    return 1
+}
+
 SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
@@ -602,18 +742,27 @@ zero_active=0
 for mirrorlist in "${MIRRORLISTS[@]}"; do
     if [[ "${mirrorlist,,}" != *cachyos* ]]; then
         healthy="$ARCH_MIRRORS"
-    elif [[ "${mirrorlist,,}" == *v4* ]]; then
-        healthy="$TMP_V4"
-    elif [[ "${mirrorlist,,}" == *v3* ]]; then
-        healthy="$TMP_V3"
+        known="$KNOWN_ARCH"
     else
-        healthy="$TMP"
+        known="$KNOWN_CACHYOS"
+        if [[ "${mirrorlist,,}" == *v4* ]]; then
+            healthy="$TMP_V4"
+        elif [[ "${mirrorlist,,}" == *v3* ]]; then
+            healthy="$TMP_V3"
+        else
+            healthy="$TMP"
+        fi
     fi
+
+    mapfile -t HEALTHY_URLS < "$healthy"
+    mapfile -t KNOWN_URLS < "$known"
 
     new_temp || die 'cannot create temporary file'
     candidate=$NEW_TEMP_PATH
+    other_count=0
 
     # Match literal URL prefixes in Bash; API data is never executable syntax.
+    # healthy -> active; known but unhealthy -> disabled; not known -> left as it is.
     while IFS= read -r line || [[ -n "$line" ]]; do
         if [[ "$line" == "$MARK"Server\ =\ * ]]; then
             line="${line#"$MARK"}"
@@ -621,21 +770,15 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
 
         if [[ "$line" == Server\ =\ * ]]; then
             server="${line#Server = }"
-            healthy_match=0
 
-            while IFS= read -r url || [[ -n "$url" ]]; do
-                [[ -n "$url" ]] || continue
-
-                if [[ "$server" == "$url/"* || "$server" == "$url" ]]; then
-                    healthy_match=1
-                    break
-                fi
-            done < "$healthy"
-
-            if [[ "$healthy_match" -eq 1 ]]; then
+            if matches_any "$server" "${HEALTHY_URLS[@]}"; then
                 printf '%s\n' "$line"
-            else
+            elif matches_any "$server" "${KNOWN_URLS[@]}"; then
                 printf '%s%s\n' "$MARK" "$line"
+            else
+                other_count=$((other_count + 1))
+                OTHER_SERVERS+=("$mirrorlist: $server")
+                printf '%s\n' "$line"
             fi
         else
             printf '%s\n' "$line"
@@ -662,17 +805,20 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     [[ "$name" == mirrorlist ]] && name=arch
     name="${name%-mirrorlist}"
 
+    other_note=''
+    [[ "$other_count" -eq 0 ]] || other_note=", ${other_count} other"
+
     [[ "$first" -eq 1 ]] || {
         SUMMARY+=' | '
         SUMMARY_PLAIN+=' | '
     }
 
-    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s)' \
+    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s%s)' \
         "$name" "$GREEN" "$active_count" "$RESET" \
-        "$RED" "$commented_count" "$RESET")
+        "$RED" "$commented_count" "$RESET" "$other_note")
 
-    SUMMARY_PLAIN+=$(printf '%s (%s/%s)' \
-        "$name" "$active_count" "$commented_count")
+    SUMMARY_PLAIN+=$(printf '%s (%s/%s%s)' \
+        "$name" "$active_count" "$commented_count" "$other_note")
 
     first=0
 done
@@ -694,6 +840,10 @@ if [[ "$zero_active" -eq 1 ]]; then
     exit 1
 fi
 
-commit_changes || die 'mirrorlist update failed; check the errors above'
+if [[ "$DRY_RUN" -eq 1 ]]; then
+    report_pending
+else
+    commit_changes || die 'mirrorlist update failed; check the errors above'
+fi
 
 print_summary
