@@ -18,11 +18,11 @@ No aliases or wrappers are needed.
 Example output of hm:  
 ![Example output of hm](docs/output.png)
 
-See [Usage](#usage) for manual operation and [hm-daemon](#hm-daemon) for details and configuration.
+See [Usage](#usage) for manual operation, [hm-daemon](#hm-daemon) for details and configuration and [Limitations](#limitations) for what `hm` deliberately does not do.
 
 ## What it does
 
-The `hm` script reads existing mirror-list files included via `/etc/pacman.conf` (including ordinary shell-glob patterns) and checks the current CachyOS and Arch Linux mirror status using their respective APIs. Non-absolute or missing `Include` entries are skipped; if no existing mirror-list file is found, the script fails.
+The `hm` script reads existing mirror-list files included via `/etc/pacman.conf` (including ordinary shell-glob patterns) and checks the current CachyOS and Arch Linux mirror status using their respective APIs. Non-absolute or missing `Include` entries are skipped; if no existing mirror-list file is found, the script fails. A mirror-list file that is a symlink is an error (see [Limitations](#limitations)).
 
 For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
 
@@ -32,9 +32,22 @@ The script updates the mirrorlist files by commenting out unhealthy mirrors with
 
 Only mirrors that the APIs know are ever disabled: a mirror is commented out when the API lists it and reports it as unhealthy. Mirrors the APIs do not list at all (a local cache, your own server, a company mirror, ...) are left exactly as they are and count as active in the summary. For example, on CachyOS the `cachyos-rate-mirrors` tool typically puts `https://archlinux.cachyos.org/repo/$repo/os/$arch` at the top of `/etc/pacman.d/mirrorlist`; the Arch mirror status API does not list it, so `hm` keeps it and the Arch list is summarized as `, 1 other`. `hm` cannot judge such mirrors: if one of them is unreachable from your location, remove it from the list yourself. Side effect: a mirror that has been removed from the API, or a variant of a mirror (for example `http://`) that the API does not list, also stays active.
 
-Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (only the `#UH#` marker at the start of a line may change), and then replaced atomically with `mv`. If any step fails, files already replaced are restored from their backups. Nothing is written if any repository would end up without an active mirror, so a failed run leaves the mirrorlists as they were (never half-written). API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain. `hm` removes `.hm-stage.*` files older than one day (as root on every run, as a regular user whenever it writes anyway); `.hm-backup.*` files are never removed automatically, because after a failed rollback a backup may be the only intact copy.
+`hm` fails closed. It changes nothing (and exits with a non-zero status) if any list would end up without an active mirror, or if a list contains mirrors the API knows but none of them is healthy: unmanaged mirrors alone are not accepted as a replacement for the official ones, which usually means that the API data is wrong or the API is down.
 
-After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list (`on/off`); when mirrors unknown to the APIs were left untouched, their number is added as `, N other` (they are included in `on`). If any repository has no active mirrors, it prints a warning and exits with a non-zero status.
+API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. Entries of an API response that cannot be used are skipped with a warning (`ignored N of M malformed entries`); a response in which more than half of the entries are malformed is refused.
+
+Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (the only difference may be the `#UH#` marker in front of `Server = ` lines), and then replaced with `mv`. If any step fails, files already replaced are restored from their backups, so a failed run leaves the mirrorlists as they were. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. Each individual file is replaced atomically, but a set of files cannot be replaced as one atomic operation (see [Limitations](#limitations)). If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain. `hm` removes `.hm-stage.*` files older than one day (as root on every run, as a regular user whenever it writes anyway); `.hm-backup.*` files are never removed automatically, because after a failed rollback a backup may be the only intact copy. A successfully restored file consumes its backup, so only backups of files that could not be restored are kept, and they are reported.
+
+After processing the mirror lists, it prints a summary showing the number of active and disabled mirrors for each list (`on/off`); when mirrors unknown to the APIs were left untouched, their number is added as `, N other` (they are included in `on`).
+
+## Limitations
+
+- **Symlinked mirrorlists are not supported.** `hm` stops with an error. Updating a symlink would write through it, outside of the transaction (copying a symlink over the staging file with `cp -a` turns the staging file itself into a symlink).
+- **`Include` paths containing whitespace are not supported.** They are split into words and not recognized. The installer refuses them as well.
+- **A set of files is not replaced atomically.** Every file is replaced atomically (and each one is valid on its own), but a program that reads the mirrorlists while `hm` runs may briefly see some lists updated and others not. When `hm` is started by `hm-daemon`, such programs are held until it finishes. After a crash or power loss, every file is either the old or the new version, and leftover `.hm-stage.*` / `.hm-backup.*` files may remain.
+- **No locking between runs.** Two `hm` runs at the same time (for example a manual `hm` while the daemon runs one) are not serialized. The result is one of the valid states, possibly built from two different API snapshots; the next run corrects it.
+- **Unmanaged mirrors are never judged** (see above), and a failed run keeps the lists as they were: they may be out of date, never half-written.
+- **Abbreviated long options** of `pacman` (such as `--syn`) are not recognized by `hm-daemon`.
 
 ## Requirements
 
@@ -72,7 +85,7 @@ Both installers use only files from the local checkout; they never download anyt
 `install-daemon.sh` additionally:
 
 - requires `hm` to be installed already (run `./install.sh` first) and checks that `hm` and every path component up to `/` are root-owned, not symlinks and not group/world-writable,
-- asks `hm --list` which mirrorlists exist, so that `hm` and the service sandbox agree on the writable directories,
+- asks `hm --list` which mirrorlists exist, so that `hm` and the service sandbox agree on the writable directories (`hm --list` stops with an error when a mirrorlist is a symlink),
 - generates the hardened unit and **restores the previous version if the new service does not start** (it must stay up for 2 seconds without a restart).
 
 Use `SRC=/path/to/file ./install.sh` or `SRC=/path/to/hm-daemon ./install-daemon.sh` to install from another local path.
@@ -119,7 +132,7 @@ hm
 |---|---|
 | `-c`, `--clean` | Remove the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files |
 | `-n`, `--dry-run` | Show what would change (which mirrors would be disabled or enabled, which stale staging files removed, which mirrors are left as they are because the APIs do not know them) and the resulting summary, but write nothing and do not ask for `sudo`. Works together with `--clean` |
-| `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Mirrorlists that are symlinks are not supported by `hm` |
+| `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Fails if a mirrorlist is a symlink |
 | `--notify-test` | Send a test desktop notification and exit |
 | `-h`, `--help` | Show the help message |
 
@@ -242,7 +255,7 @@ Process names are not authenticated: any local process named `pacman` (or matchi
 
 ## Error notifications
 
-When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable API responses, failed `sudo` authentication and repositories without any active mirror. In a terminal the error is printed as usual and no notification is sent.
+When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable or broken API responses, failed `sudo` authentication, symlinked mirrorlists, repositories without any active mirror and repositories without a healthy API-listed mirror. In a terminal the error is printed as usual and no notification is sent.
 
 - When run as a regular user, `hm` calls `notify-send` directly.
 - When run as root (by the daemon), `hm` notifies every active user session, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).

@@ -58,7 +58,6 @@ NOTIFY_MODE="${HM_NOTIFY:-auto}"
 declare -a TEMPFILES=()
 declare -a TARGETS=()
 declare -a CANDIDATES=()
-declare -a OTHER_SERVERS=()
 
 NEW_TEMP_PATH=''
 
@@ -186,9 +185,9 @@ run_priv() {
     fi
 }
 
-# Invariant: toggling #UH# may change only the marker at the start of a line.
-# Normalize both files (drop one leading marker, ensure a final newline) and
-# compare them byte-for-byte.
+# Invariant: the only difference between a mirrorlist and its candidate may be the
+# #UH# marker in front of "Server = " lines. Normalize both files (remove the marker
+# from Server lines only, ensure a final newline) and compare them byte-for-byte.
 assert_invariant() {
     local original="$1" candidate="$2"
     local original_normalized candidate_normalized
@@ -199,8 +198,8 @@ assert_invariant() {
         return 1
     }
 
-    if ! sed -e 's/^#UH#//' -e '$a\' "$original" > "$original_normalized" ||
-       ! sed -e 's/^#UH#//' -e '$a\' "$candidate" > "$candidate_normalized" ||
+    if ! sed -e 's/^#UH#Server = /Server = /' -e '$a\' "$original" > "$original_normalized" ||
+       ! sed -e 's/^#UH#Server = /Server = /' -e '$a\' "$candidate" > "$candidate_normalized" ||
        ! cmp -s -- "$original_normalized" "$candidate_normalized"; then
         rm -f -- "$original_normalized" "$candidate_normalized"
         return 1
@@ -236,6 +235,8 @@ allow_termination() {
 # ---------------------------------------------------------------------------
 # Read pacman Include directives.
 # Expand ordinary shell globs and ignore missing optional files.
+# A mirrorlist that is a symlink is an error: updating it would write through the
+# link, outside of the transaction (cp -a turns the staging file into a symlink).
 # ---------------------------------------------------------------------------
 
 declare -a MIRRORLISTS=()
@@ -255,6 +256,9 @@ while IFS= read -r include; do
     shopt -u nullglob
 
     for mirrorlist in "${matches[@]}"; do
+        if [[ -L "$mirrorlist" ]]; then
+            die "$mirrorlist is a symlink (to $(readlink -- "$mirrorlist")); symlinked mirrorlists are not supported because updating one would write through the link, outside of the transaction"
+        fi
         [[ -f "$mirrorlist" ]] || continue
         [[ -z "${SEEN_LISTS[$mirrorlist]:-}" ]] || continue
 
@@ -355,6 +359,8 @@ describe_changes() {   # $1 = current file, $2 = candidate file (same lines, onl
     ' "$1" "$2"
 }
 
+declare -a OTHER_SERVERS=()
+
 report_pending() {
     local i f
 
@@ -370,22 +376,23 @@ report_pending() {
     fi
 
     for f in "${OTHER_SERVERS[@]}"; do
-      printf 'hm: left as it is (not known to the API): %s\n' "$f"
+        printf 'hm: left as it is (not known to the API): %s\n' "$f"
     done
 
     while IFS= read -r f; do
-      [[ -n "$f" ]] && printf 'hm: would remove stale staging file %s\n' "$f"
+        [[ -n "$f" ]] && printf 'hm: would remove stale staging file %s\n' "$f"
     done < <(stale_stage_files)
 
-return 0
+    return 0
 }
 
 # ---------------------------------------------------------------------------
 # Transactional replacement
 #
 # Prepare every staged file and backup before replacing any target.
-# Each individual rename is atomic. If a later rename fails, roll back
-# previously committed files. Backups are created alongside their targets.
+# Each individual rename is atomic; the set of files is not (see README).
+# If a later rename fails, roll back previously committed files. Backups are
+# created alongside their targets.
 # (Authentication, stale-file cleanup and termination deferral are handled by
 # commit_changes.)
 # ---------------------------------------------------------------------------
@@ -404,6 +411,7 @@ transactional_commit() {
 
     local -a STAGES=()
     local -a BACKUPS=()
+    local -a KEPT=()      # indices of backups that must stay because their restoration failed
 
     # Prepare every stage and backup before committing anything.
     for i in "${!TARGETS[@]}"; do
@@ -411,8 +419,8 @@ transactional_commit() {
         candidate="${CANDIDATES[$i]}"
         dir="${target%/*}"
 
-        [[ -f "$target" && -f "$candidate" ]] || {
-            printf 'hm: target or candidate disappeared: %s\n' "$target" >&2
+        [[ -f "$target" && ! -L "$target" && -f "$candidate" ]] || {
+            printf 'hm: target disappeared, is not a regular file or is a symlink: %s\n' "$target" >&2
             rollback_failed=1
             break
         }
@@ -433,8 +441,11 @@ transactional_commit() {
         STAGES+=("$stage")
         BACKUPS+=("$backup")
 
+        # The staging file and the backup must stay regular files: if either became a
+        # symlink, writing the candidate would go through it, outside of the transaction.
         run_priv cp -a -- "$target" "$stage" &&
             run_priv cp -a -- "$target" "$backup" &&
+            [[ ! -L "$stage" && ! -L "$backup" ]] &&
             run_priv bash -c 'cat -- "$1" > "$2"' _ "$candidate" "$stage" || {
                 printf 'hm: cannot prepare replacement for %s\n' "$target" >&2
                 rollback_failed=1
@@ -474,7 +485,9 @@ transactional_commit() {
     done
 
     if [[ "$rollback_failed" -ne 0 ]]; then
-        # Restore only files already replaced. Keep backups if restoration fails.
+        # Restore the files that were already replaced. A successful restoration moves the
+        # backup over the target, so that backup no longer exists; a backup whose restoration
+        # failed is kept (KEPT) and reported, because it may be the only intact copy.
         for ((i = committed - 1; i >= 0; i--)); do
             target="${TARGETS[$i]}"
             backup="${BACKUPS[$i]}"
@@ -483,6 +496,7 @@ transactional_commit() {
                 printf 'hm: CRITICAL: rollback failed for %s\n' "$target" >&2
                 printf 'hm: backup retained at %s\n' "$backup" >&2
                 rollback_failed=2
+                KEPT[i]=1
             fi
         done
 
@@ -490,11 +504,10 @@ transactional_commit() {
             run_priv rm -f -- "${STAGES[$i]}" || true
         done
 
-        # Do not remove backups whose restoration failed.
+        # Remove every backup except those that could not be restored.
         for i in "${!BACKUPS[@]}"; do
-            if [[ "$rollback_failed" -ne 2 || "$i" -ge "$committed" ]]; then
-                run_priv rm -f -- "${BACKUPS[$i]}" || true
-            fi
+            [[ -z "${KEPT[$i]:-}" ]] || continue
+            run_priv rm -f -- "${BACKUPS[$i]}" || true
         done
 
         if [[ "$rollback_failed" -eq 2 ]]; then
@@ -579,8 +592,8 @@ fi
 
 # ---------------------------------------------------------------------------
 # API downloads and validation
-# Malformed single entries are skipped by the jq filters; the response as a
-# whole must contain at least one usable entry.
+# Malformed single entries are skipped by the jq filters (and reported); a
+# response in which more than half of the entries are malformed is refused.
 # ---------------------------------------------------------------------------
 
 new_temp || die 'cannot create temporary file'
@@ -600,6 +613,25 @@ KNOWN_CACHYOS=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
 KNOWN_ARCH=$NEW_TEMP_PATH
 
+# $1 = API name, $2 = "total usable" entry counts
+check_entries() {
+    local api="$1" total usable malformed
+
+    read -r total usable <<<"$2"
+    [[ "$total" =~ ^[0-9]+$ && "$usable" =~ ^[0-9]+$ ]] ||
+        die "cannot count the entries of the $api API response"
+
+    malformed=$((total - usable))
+
+    if (( malformed * 2 > total )); then
+        die "the $api API response looks broken: $malformed of $total entries are malformed"
+    fi
+    if (( malformed > 0 )); then
+        printf 'hm: warning: ignored %d of %d malformed entries in the %s API response\n' \
+            "$malformed" "$total" "$api" >&2
+    fi
+}
+
 curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" -o "$JSON_CACHYOS" ||
     die 'cannot download CachyOS mirror status'
 
@@ -611,6 +643,14 @@ jq -e '
 ' "$JSON_CACHYOS" >/dev/null ||
     die 'invalid or incomplete CachyOS API response'
 
+counts=$(jq -r '
+    [ (.mirrors | length),
+      ([ .mirrors[]
+         | select((.url | type == "string") and (.checks | type == "array"))
+       ] | length) ] | @tsv
+' "$JSON_CACHYOS") || die 'cannot count the entries of the CachyOS API response'
+check_entries CachyOS "$counts"
+
 curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" ||
     die 'cannot download Arch Linux mirror status'
 
@@ -621,6 +661,14 @@ jq -e '
          ] | length) > 0
 ' "$JSON_ARCH" >/dev/null ||
     die 'invalid or incomplete Arch Linux API response'
+
+counts=$(jq -r '
+    [ (.urls | length),
+      ([ .urls[]
+         | select((.url | type == "string") and (.protocol | type == "string"))
+       ] | length) ] | @tsv
+' "$JSON_ARCH") || die 'cannot count the entries of the Arch Linux API response'
+check_entries 'Arch Linux' "$counts"
 
 # Validate URLs without treating data as sed/regex syntax.
 validate_urls() {
@@ -664,7 +712,7 @@ jq -r '
 # ---------------------------------------------------------------------------
 # CachyOS health lists
 # An empty list is not an error here: it only matters if a mirrorlist that
-# uses it would end up without active servers (handled by zero_active below).
+# uses it would end up without a healthy mirror (handled below).
 # ---------------------------------------------------------------------------
 
 for architecture in x86_64 x86_64_v3 x86_64_v4; do
@@ -738,8 +786,13 @@ SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
 zero_active=0
+no_healthy_names=''
 
 for mirrorlist in "${MIRRORLISTS[@]}"; do
+    name=$(basename "$mirrorlist")
+    [[ "$name" == mirrorlist ]] && name=arch
+    name="${name%-mirrorlist}"
+
     if [[ "${mirrorlist,,}" != *cachyos* ]]; then
         healthy="$ARCH_MIRRORS"
         known="$KNOWN_ARCH"
@@ -759,6 +812,8 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
 
     new_temp || die 'cannot create temporary file'
     candidate=$NEW_TEMP_PATH
+    healthy_hit=0
+    disabled_hit=0
     other_count=0
 
     # Match literal URL prefixes in Bash; API data is never executable syntax.
@@ -772,8 +827,10 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
             server="${line#Server = }"
 
             if matches_any "$server" "${HEALTHY_URLS[@]}"; then
+                healthy_hit=$((healthy_hit + 1))
                 printf '%s\n' "$line"
             elif matches_any "$server" "${KNOWN_URLS[@]}"; then
+                disabled_hit=$((disabled_hit + 1))
                 printf '%s%s\n' "$MARK" "$line"
             else
                 other_count=$((other_count + 1))
@@ -793,6 +850,12 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
         zero_active=1
     fi
 
+    # The list has mirrors the API knows, but none of them is healthy: do not leave the list
+    # with only unmanaged servers (they cannot be vouched for), keep it as it is.
+    if [[ "$disabled_hit" -gt 0 && "$healthy_hit" -eq 0 ]]; then
+        no_healthy_names+="${no_healthy_names:+, }$name"
+    fi
+
     assert_invariant "$mirrorlist" "$candidate" ||
         die "invariant check failed for $mirrorlist; no changes committed"
 
@@ -800,10 +863,6 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
         TARGETS+=("$mirrorlist")
         CANDIDATES+=("$candidate")
     fi
-
-    name=$(basename "$mirrorlist")
-    [[ "$name" == mirrorlist ]] && name=arch
-    name="${name%-mirrorlist}"
 
     other_note=''
     [[ "$other_count" -eq 0 ]] || other_note=", ${other_count} other"
@@ -828,14 +887,24 @@ print_summary() {
         "$GREEN" "$RESET" "$RED" "$RESET" "$SUMMARY"
 }
 
-# Fail closed: do not commit if any mirrorlist would have no active server.
-if [[ "$zero_active" -eq 1 ]]; then
+# Fail closed: change nothing if any list would have no active server, or if a list has
+# mirrors known to the API but none of them is healthy.
+if [[ "$zero_active" -eq 1 || -n "$no_healthy_names" ]]; then
     print_summary
-    printf '%sWARNING:%s no active mirrors available in at least one repo; no changes committed.\n' \
-        "$WARNING_STYLE" "$RESET"
 
-    desktop_notify 'hm: no active mirrors' \
-        "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. No changes committed."
+    if [[ "$zero_active" -eq 1 ]]; then
+        printf '%sWARNING:%s no active mirrors available in at least one repo; no changes committed.\n' \
+            "$WARNING_STYLE" "$RESET"
+        desktop_notify 'hm: no active mirrors' \
+            "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. No changes committed."
+    fi
+
+    if [[ -n "$no_healthy_names" ]]; then
+        printf '%sWARNING:%s none of the mirrors listed by the API is healthy in: %s; no changes committed.\n' \
+            "$WARNING_STYLE" "$RESET" "$no_healthy_names"
+        desktop_notify 'hm: no healthy mirror' \
+            "None of the mirrors listed by the API is healthy in: ${no_healthy_names}. No changes committed."
+    fi
 
     exit 1
 fi
