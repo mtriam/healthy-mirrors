@@ -151,6 +151,99 @@ grep -q 'will not be detected' "$LOG" && ok "symlink warning says that replaceme
                                        || bad "symlink warning missing or wrong"
 stop_daemon
 
+echo "== 9. classification of command lines (hm-daemon is imported, nothing is started)"
+out=$(python3 - "$D" <<'PY' 2>&1
+import importlib.machinery, importlib.util, sys
+sys.dont_write_bytecode = True
+loader = importlib.machinery.SourceFileLoader("hmd", sys.argv[1])
+spec = importlib.util.spec_from_loader("hmd", loader)
+m = importlib.util.module_from_spec(spec)
+loader.exec_module(m)
+m.load_config()
+
+cases = [
+    ("pacman", ["pacman", "-Syu"], True),
+    ("pacman", ["pacman", "--sync", "--refresh", "--sysupgrade"], True),
+    ("pacman", ["pacman", "--sync", "--noconfirm", "--", "pkg"], True),
+    ("pacman", ["pacman", "--upgrade", "--noconfirm", "--", "/tmp/a.pkg.tar.zst"], True),
+    ("pacman", ["pacman", "-U", "/tmp/a.pkg.tar.zst"], True),
+    ("pacman", ["pacman", "-Ss", "foo"], True),
+    ("pacman", ["pacman", "--files", "--refresh"], True),
+    ("pacman", ["pacman", "--files", "-y"], True),
+    ("pacman", ["pacman", "-F", "--refresh"], True),
+    ("pacman", ["pacman", "-F", "-y"], True),
+    ("pacman", ["pacman", "-Fy"], True),
+    ("pacman", ["pacman", "-F", "foo"], False),
+    ("pacman", ["pacman", "--files", "foo"], False),
+    ("pacman", ["pacman", "-Qs", "S"], False),
+    ("pacman", ["pacman", "--query", "--search", "x"], False),
+    ("pacman", ["pacman", "-Qtdq"], False),
+    ("pacman", ["pacman", "--database", "--asdeps", "--", "dbus-glib"], False),
+    ("pacman", ["pacman", "-T", "dbus"], False),
+    ("pacman", ["pacman", "--sysupgrade"], False),
+    ("pacman", ["pacman", "-b/var/lib/US", "-Q"], False),
+    ("pacman", ["pacman", "-Rns", "foo"], False),
+    ("yay",    ["yay"], True),
+    ("yay",    ["yay", "firefox"], True),
+    ("yay",    ["yay", "-Qua"], False),
+    ("yay",    ["yay", "--sync", "--sysupgrade"], True),
+    ("paru",   ["paru", "-Sua"], True),
+    ("octopi", ["octopi"], True),
+    ("octopi-notifier", ["octopi-notifier"], False),
+    ("shelly", ["shelly", "sync", "--force"], True),
+    ("cat",    ["cat", "-S"], False),
+]
+bad = 0
+for comm, argv, want in cases:
+    got = m.should_trigger(comm, argv)
+    if got != want:
+        bad += 1
+        print(f"  {comm}: {' '.join(argv[1:])} -> {got}, expected {want}")
+print(f"{len(cases) - bad}/{len(cases)} classification cases OK")
+sys.exit(1 if bad else 0)
+PY
+)
+rc=$?
+if [[ $rc -eq 0 ]]; then ok "$out"; else bad "classification: $out"; fi
+
+echo "== 10. the log names every process but shows command lines only for clients"
+start_daemon
+cat "$CONF" >/dev/null
+sleep 0.3
+pac
+sleep 0.8
+if grep -q 'comm=cat trigger=False' "$LOG" && ! grep -q 'comm=cat .*cmd=' "$LOG"; then
+    ok "another process is logged by name only"
+else
+    bad "log of a non-client process is missing or contains its command line"
+fi
+grep -q 'comm=pacman cmd=' "$LOG" && ok "pacman is logged with its command line" \
+                                   || bad "pacman command line missing in the log"
+stop_daemon
+
+echo "== 11. cooldown: the first request starts hm, a second one within the cooldown does not"
+start_daemon COOLDOWN=30
+pac
+sleep 0.5
+pac
+sleep 0.5
+n=$(started)
+[[ $n -eq 1 ]] && ok "hm was started exactly once (fresh daemon is not in cooldown)" \
+               || bad "hm was started $n times (expected 1)"
+grep -q 'trigger=True cooldown=True' "$LOG" && ok "second request logged as cooldown=True" \
+                                            || bad "cooldown not logged for the second request"
+stop_daemon
+
+echo "== 12. hm fails: the request is released and the failure is logged at error priority"
+printf '#!/bin/sh\nexit 3\n' > "$T/fail-hm"
+chmod +x "$T/fail-hm"
+start_daemon HM="$T/fail-hm"
+timeout 5 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
+[[ $? -ne 124 ]] && ok "request was released after a failed hm" || bad "request stayed blocked"
+grep -qF '<3>hm FAILED (exit code 3)' "$LOG" && ok "failure logged with error priority" \
+                                              || bad "failure not logged as expected"
+stop_daemon
+
 echo
 echo "passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]]

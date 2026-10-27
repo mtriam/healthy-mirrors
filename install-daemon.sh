@@ -197,6 +197,8 @@ RestrictRealtime=yes
 RestrictSUIDSGID=yes
 LockPersonality=yes
 SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+ProcSubset=pid
 UMask=0077
 # CAP_SYS_ADMIN: fanotify_init with permission events (verified: without it the daemon
 #   stops with "fanotify_init: Operation not permitted")

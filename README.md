@@ -240,7 +240,7 @@ Numbers must be finite; a value that does not match its constraint makes the ser
 
 The daemon runs as root and executes `/usr/local/bin/hm` as root. `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `install-daemon.sh` checks this when installing.
 
-The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The generated unit (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
+The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces, no writable-and-executable memory (`MemoryDenyWriteExecute`), a `/proc` that shows only process directories (`ProcSubset=pid`) and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The generated unit (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
 
 Capabilities are limited to three, all verified to be necessary:
 
@@ -286,7 +286,7 @@ systemd-analyze security hm-daemon.service
 
 ## Tests
 
-`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client.
+`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client. Test 9 imports `hm-daemon` as a module (nothing is started) to check how command lines are classified.
 
 ```bash
 ./test-hm-daemon.sh                      # uses ./hm-daemon
@@ -305,8 +305,12 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 6 | `hm` exceeds `HM_TIMEOUT` and has a child in another session: both are killed and the request is released |
 | 7 | Invalid configuration (`MAX_HELD=0`, `HM_TIMEOUT=nan`): the daemon exits with status 1 and names the variable |
 | 8 | A symlinked watch path with `RECHECK=0` produces a warning that replacement will not be detected |
+| 9 | Classification of 30 command lines: short and long `pacman` options (including `-F -y`, `--files -y`, `-b/path`), AUR helpers, `shelly`, other programs |
+| 10 | The log names every process that opens the file, but shows command lines only for `pacman`, AUR helpers and `shelly` |
+| 11 | Cooldown: a fresh daemon starts `hm` for the first request, a second request within the cooldown does not start it again |
+| 12 | `hm` exits with an error: the request is released and the failure is logged at error priority |
 
-A successful run ends with `passed: 23, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case fails on a heavily loaded system, run the script again before investigating.
+A successful run ends with `passed: 30, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used). If a single case fails on a heavily loaded system, run the script again before investigating.
 
 The script does **not** cover `hm` itself (mirror evaluation, transactional updates), desktop notifications, the systemd sandbox or the installers. Check those with:
 
