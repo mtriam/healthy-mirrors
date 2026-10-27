@@ -785,8 +785,7 @@ matches_any() {
 SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
-zero_active=0
-no_healthy_names=''
+declare -a PROBLEMS=()     # lists that make hm leave everything unchanged: "name: reason"
 
 for mirrorlist in "${MIRRORLISTS[@]}"; do
     name=$(basename "$mirrorlist")
@@ -846,14 +845,16 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     active_count=$(grep -c '^Server = ' "$candidate" || true)
     commented_count=$(grep -c "^${MARK}Server = " "$candidate" || true)
 
-    if [[ "$active_count" -eq 0 ]]; then
-        zero_active=1
-    fi
-
-    # The list has mirrors the API knows, but none of them is healthy: do not leave the list
-    # with only unmanaged servers (they cannot be vouched for), keep it as it is.
+    # One reason per list. A list that has mirrors the API knows, but none of them healthy, is
+    # kept as it is even if unmanaged servers are present (they cannot be vouched for).
     if [[ "$disabled_hit" -gt 0 && "$healthy_hit" -eq 0 ]]; then
-        no_healthy_names+="${no_healthy_names:+, }$name"
+        if [[ "$active_count" -eq 0 ]]; then
+            PROBLEMS+=("$name: none of the mirrors listed by the API is healthy (no active mirror would be left)")
+        else
+            PROBLEMS+=("$name: none of the mirrors listed by the API is healthy (only mirrors unknown to the API would stay active)")
+        fi
+    elif [[ "$active_count" -eq 0 ]]; then
+        PROBLEMS+=("$name: no active mirror")
     fi
 
     assert_invariant "$mirrorlist" "$candidate" ||
@@ -887,24 +888,18 @@ print_summary() {
         "$GREEN" "$RESET" "$RED" "$RESET" "$SUMMARY"
 }
 
-# Fail closed: change nothing if any list would have no active server, or if a list has
-# mirrors known to the API but none of them is healthy.
-if [[ "$zero_active" -eq 1 || -n "$no_healthy_names" ]]; then
+# Fail closed: change nothing if a list would have no active server, or if a list has
+# mirrors known to the API but none of them is healthy. One message, one notification.
+if [[ "${#PROBLEMS[@]}" -gt 0 ]]; then
+    problems=''
+    for problem in "${PROBLEMS[@]}"; do
+        problems+="${problems:+; }$problem"
+    done
+
     print_summary
-
-    if [[ "$zero_active" -eq 1 ]]; then
-        printf '%sWARNING:%s no active mirrors available in at least one repo; no changes committed.\n' \
-            "$WARNING_STYLE" "$RESET"
-        desktop_notify 'hm: no active mirrors' \
-            "At least one repository has no active mirror (on/off): ${SUMMARY_PLAIN}. No changes committed."
-    fi
-
-    if [[ -n "$no_healthy_names" ]]; then
-        printf '%sWARNING:%s none of the mirrors listed by the API is healthy in: %s; no changes committed.\n' \
-            "$WARNING_STYLE" "$RESET" "$no_healthy_names"
-        desktop_notify 'hm: no healthy mirror' \
-            "None of the mirrors listed by the API is healthy in: ${no_healthy_names}. No changes committed."
-    fi
+    printf '%sWARNING:%s no changes committed: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+    desktop_notify 'hm: mirrors not updated' \
+        "No changes committed: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}."
 
     exit 1
 fi
