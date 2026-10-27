@@ -128,13 +128,14 @@ Without the daemon, run `hm` manually before using the mirror lists, or use the 
 hm
 ```
 
-| Option | Meaning |
-|---|---|
-| `-c`, `--clean` | Remove the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files |
-| `-n`, `--dry-run` | Show what would change (which mirrors would be disabled or enabled, which stale staging files removed, which mirrors are left as they are because the APIs do not know them) and the resulting summary, but write nothing and do not ask for `sudo`. Works together with `--clean` |
-| `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Fails if a mirrorlist is a symlink |
-| `--notify-test` | Send a test desktop notification and exit |
-| `-h`, `--help` | Show the help message |
+| Short option | Long option | Meaning |
+|---|---|---|
+| `-c` | `--clean` | Remove the `#UH#` marker prefix from previously flagged `Server = ...` lines. It does not delete mirrors or restore a backup of the original mirrorlist files |
+| `-n` | `--dry-run` | Show what would change (which mirrors would be disabled or enabled, which stale staging files removed, which mirrors are left as they are because the APIs do not know them) and the resulting summary, but write nothing and do not ask for `sudo`. Works together with `--clean` |
+| | `--list` | Print the mirrorlist files `hm` manages (the existing files from the `Include` lines of `pacman.conf`) and exit, without network access or writes. Fails if a mirrorlist is a symlink |
+| | `--notify-test` | Send a test desktop notification and exit |
+| `-h` | `--help` | Show the help message |
+
 
 `--list` and `--notify-test` cannot be combined with other options; `--dry-run` can be combined with `--clean`. Set `HM_NOTIFY=auto|always|never` to control desktop notifications on errors (default `auto`, see [Error notifications](#error-notifications); notifications are always off with `--dry-run` and `--list`).
 
