@@ -711,8 +711,8 @@ jq -r '
 
 # ---------------------------------------------------------------------------
 # CachyOS health lists
-# An empty list is not an error here: it only matters if a mirrorlist that
-# uses it would end up without a healthy mirror (handled below).
+# An empty list is not an error here: it only matters for a mirrorlist that
+# uses it (such a list is skipped below, the other lists are still updated).
 # ---------------------------------------------------------------------------
 
 for architecture in x86_64 x86_64_v3 x86_64_v4; do
@@ -766,6 +766,12 @@ validate_urls "$ARCH_MIRRORS" ||
 
 # ---------------------------------------------------------------------------
 # Build and validate all candidates before touching any mirrorlist.
+#
+# Every list is judged on its own. A list that cannot be updated safely is left exactly
+# as it is (and reported); the other lists are updated as usual:
+#   - no active "Server = " line would be left, or
+#   - the list has mirrors the API knows, but none of them is healthy (unmanaged mirrors
+#     alone are no replacement for them: they cannot be vouched for).
 # ---------------------------------------------------------------------------
 
 # True if the Server value ($1) starts with one of the URLs given as the remaining arguments.
@@ -785,7 +791,8 @@ matches_any() {
 SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
-declare -a PROBLEMS=()     # lists that make hm leave everything unchanged: "name: reason"
+skipped_count=0
+declare -a PROBLEMS=()     # "name: reason" for every list that is left unchanged
 
 for mirrorlist in "${MIRRORLISTS[@]}"; do
     name=$(basename "$mirrorlist")
@@ -845,24 +852,37 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     active_count=$(grep -c '^Server = ' "$candidate" || true)
     commented_count=$(grep -c "^${MARK}Server = " "$candidate" || true)
 
-    # One reason per list. A list that has mirrors the API knows, but none of them healthy, is
-    # kept as it is even if unmanaged servers are present (they cannot be vouched for).
+    # Decide whether this list can be updated.
+    skip_reason=''
     if [[ "$disabled_hit" -gt 0 && "$healthy_hit" -eq 0 ]]; then
         if [[ "$active_count" -eq 0 ]]; then
-            PROBLEMS+=("$name: none of the mirrors listed by the API is healthy (no active mirror would be left)")
+            skip_reason='none of the mirrors listed by the API is healthy (no active mirror would be left)'
         else
-            PROBLEMS+=("$name: none of the mirrors listed by the API is healthy (only mirrors unknown to the API would stay active)")
+            skip_reason='none of the mirrors listed by the API is healthy (only mirrors unknown to the API would stay active)'
         fi
     elif [[ "$active_count" -eq 0 ]]; then
-        PROBLEMS+=("$name: no active mirror")
+        skip_reason='no active mirror'
     fi
 
-    assert_invariant "$mirrorlist" "$candidate" ||
-        die "invariant check failed for $mirrorlist; no changes committed"
+    skip_note=''
+    skip_note_plain=''
+    if [[ -n "$skip_reason" ]]; then
+        PROBLEMS+=("$name: $skip_reason")
+        skipped_count=$((skipped_count + 1))
 
-    if ! cmp -s -- "$mirrorlist" "$candidate"; then
-        TARGETS+=("$mirrorlist")
-        CANDIDATES+=("$candidate")
+        # The list stays as it is: report its current state, not the rejected candidate.
+        active_count=$(grep -c '^Server = ' "$mirrorlist" || true)
+        commented_count=$(grep -c "^${MARK}Server = " "$mirrorlist" || true)
+        skip_note=", ${WARNING_STYLE}skipped${RESET}"
+        skip_note_plain=', skipped'
+    else
+        assert_invariant "$mirrorlist" "$candidate" ||
+            die "invariant check failed for $mirrorlist; no changes committed"
+
+        if ! cmp -s -- "$mirrorlist" "$candidate"; then
+            TARGETS+=("$mirrorlist")
+            CANDIDATES+=("$candidate")
+        fi
     fi
 
     other_note=''
@@ -873,12 +893,12 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
         SUMMARY_PLAIN+=' | '
     }
 
-    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s%s)' \
+    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s%s%s)' \
         "$name" "$GREEN" "$active_count" "$RESET" \
-        "$RED" "$commented_count" "$RESET" "$other_note")
+        "$RED" "$commented_count" "$RESET" "$other_note" "$skip_note")
 
-    SUMMARY_PLAIN+=$(printf '%s (%s/%s%s)' \
-        "$name" "$active_count" "$commented_count" "$other_note")
+    SUMMARY_PLAIN+=$(printf '%s (%s/%s%s%s)' \
+        "$name" "$active_count" "$commented_count" "$other_note" "$skip_note_plain")
 
     first=0
 done
@@ -888,19 +908,29 @@ print_summary() {
         "$GREEN" "$RESET" "$RED" "$RESET" "$SUMMARY"
 }
 
-# Fail closed: change nothing if a list would have no active server, or if a list has
-# mirrors known to the API but none of them is healthy. One message, one notification.
-if [[ "${#PROBLEMS[@]}" -gt 0 ]]; then
-    problems=''
+# One warning and one notification for all skipped lists. $1 = all | partial
+report_skipped() {
+    local problems='' problem
+
     for problem in "${PROBLEMS[@]}"; do
         problems+="${problems:+; }$problem"
     done
 
-    print_summary
-    printf '%sWARNING:%s no changes committed: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
-    desktop_notify 'hm: mirrors not updated' \
-        "No changes committed: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}."
+    if [[ "$1" == all ]]; then
+        printf '%sWARNING:%s no mirror list was updated: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        desktop_notify 'hm: no mirror list updated' \
+            "No list was updated: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}."
+    else
+        printf '%sWARNING:%s left unchanged: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        desktop_notify 'hm: some mirror lists not updated' \
+            "Left unchanged: ${problems}. The other lists were updated. Mirror summary (on/off): ${SUMMARY_PLAIN}."
+    fi
+}
 
+# Nothing can be updated: same outcome as a failed run.
+if [[ "$skipped_count" -eq "${#MIRRORLISTS[@]}" ]]; then
+    print_summary
+    report_skipped all
     exit 1
 fi
 
@@ -911,3 +941,10 @@ else
 fi
 
 print_summary
+
+# Some lists were skipped, the others are done: warn, but this is not a failure.
+if [[ "$skipped_count" -gt 0 ]]; then
+    report_skipped partial
+fi
+
+exit 0
