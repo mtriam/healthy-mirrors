@@ -4,6 +4,7 @@
 set -u
 SELF=$(readlink -f "$0")
 [[ $EUID -eq 0 ]] || exec sudo "$SELF" "$@"
+export LC_ALL=C                                        # the tests must not depend on the user's language
 
 D=$(readlink -f "${1:-${SELF%/*}/hm-daemon}")
 [[ -f $D ]] || { echo "hm-daemon not found: $D" >&2; exit 1; }
@@ -30,6 +31,9 @@ printf '#!/bin/sh\nexec sleep "${SLOW:-0.3}"\n' > "$T/slow-hm"
 chmod +x "$T/slow-hm"
 
 pac()     { "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1; }   # looks like "pacman --sync", opens the file
+# like pac, but succeeds only if the open() of the file was denied: cat then prints nothing of
+# the file on stdout (the error message is language dependent, so it is not looked at)
+denied()  { local out; out=$(timeout 10 "$T/pacman" -- --sync "$CONF" 2>/dev/null); [[ $out != *"[options]"* ]]; }
 started() { grep -c '^started ' "$LOG"; }
 secs()    { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }'; }
 between() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v >= lo && v <= hi) }'; }
@@ -143,6 +147,7 @@ check_rejected() {        # $1 = NAME=value
 }
 check_rejected MAX_HELD=0
 check_rejected HM_TIMEOUT=nan
+check_rejected DENY_ON=abc
 
 echo "== 8. symlinked watch path with the periodic check disabled"
 ln -s "$CONF" "$T/link.conf"
@@ -242,6 +247,100 @@ timeout 5 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
 [[ $? -ne 124 ]] && ok "request was released after a failed hm" || bad "request stayed blocked"
 grep -qF '<3>hm FAILED (exit code 3)' "$LOG" && ok "failure logged with error priority" \
                                               || bad "failure not logged as expected"
+stop_daemon
+
+# hm stubs for the DENY_ON tests
+printf '#!/bin/sh\nexit 2\n' > "$T/partial-hm"                 # some lists skipped
+printf '#!/bin/sh\nsleep 1\nexit 3\n' > "$T/slowfail-hm"        # fails after a second
+printf '#!/bin/sh\necho "${HM_DENY_ON-unset} ${HM_DENY_RETRY-unset}" > "$OUT"\n' > "$T/env-hm"
+chmod +x "$T/partial-hm" "$T/slowfail-hm" "$T/env-hm"
+
+echo "== 13. hm exits with 2 (some lists skipped), DENY_ON off (default): nobody is denied"
+start_daemon HM="$T/partial-hm"
+denied && bad "request was denied although DENY_ON is off" || ok "request was released"
+grep -qF '<4>hm skipped some mirror lists (exit code 2)' "$LOG" && ! grep -q 'FAILED' "$LOG" \
+    && ok "partial result logged as a warning, not as a failure" \
+    || bad "partial result not logged as expected"
+stop_daemon
+
+echo "== 14. DENY_ON=failure: a failure is denied, a partial result is not"
+start_daemon HM="$T/partial-hm" DENY_ON=failure
+denied && bad "partial result was denied at level failure" || ok "partial result does not block at level failure"
+stop_daemon
+start_daemon HM="$T/fail-hm" DENY_ON=failure
+denied && ok "failure is denied (EPERM)" || bad "failure was not denied"
+grep -qF '<3>hm FAILED (exit code 3)' "$LOG" && grep -q 'denying 1 of 1 held' "$LOG" \
+    && ok "failure and denial are logged" || bad "failure or denial not logged"
+stop_daemon
+
+echo "== 15. DENY_ON=partial: a partial result and a failure are both denied"
+start_daemon HM="$T/partial-hm" DENY_ON=partial
+denied && ok "partial result is denied (EPERM)" || bad "partial result was not denied at level partial"
+stop_daemon
+start_daemon HM="$T/fail-hm" DENY_ON=partial
+denied && ok "failure is denied (EPERM)" || bad "failure was not denied at level partial"
+stop_daemon
+
+echo "== 16. only processes that would trigger hm are denied; others that were held pass"
+start_daemon HM="$T/slowfail-hm" DENY_ON=failure
+( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & P1=$!
+sleep 0.3
+( cat "$CONF" > "$T/out.cat" 2>&1 ) & P2=$!
+wait "$P1" "$P2"
+! grep -q '^\[options\]' "$T/out.pac" && ok "the triggering process is denied" \
+                                         || bad "the triggering process was not denied"
+grep -q '^\[options\]' "$T/out.cat" \
+    && ok "an unrelated process that was held is allowed and reads the file" \
+    || bad "an unrelated process was denied"
+grep -q 'denying 1 of 2 held' "$LOG" && ok "log says 1 of 2 held requests were denied" \
+                                      || bad "denial count not logged as expected"
+stop_daemon
+
+echo "== 17. a retry within the cooldown goes through"
+start_daemon HM="$T/fail-hm" DENY_ON=failure COOLDOWN=30
+denied && ok "first start is denied" || bad "first start was not denied"
+denied && bad "retry within the cooldown was denied" || ok "retry within the cooldown is let through"
+n=$(started)
+[[ $n -eq 1 ]] && ok "hm was not started again by the retry" || bad "hm was started $n times (expected 1)"
+stop_daemon
+
+echo "== 18. timeout and a hm that cannot be started are denied too"
+start_daemon SLOW=20 HM_TIMEOUT=1 DENY_ON=failure
+denied && ok "hm timeout: the request is denied" || bad "hm timeout: the request was not denied"
+stop_daemon
+start_daemon HM=/nonexistent DENY_ON=failure
+denied && ok "hm cannot be started: the request is denied" || bad "hm cannot be started: not denied"
+stop_daemon
+
+echo "== 19. stopping the daemon never denies"
+start_daemon SLOW=20 STOP_GRACE=1 DENY_ON=partial
+( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
+sleep 1
+kill -TERM "$DPID"
+wait "$PP" 2>/dev/null
+wait "$DPID" 2>/dev/null; DPID=
+grep -q '^\[options\]' "$T/out.pac" && ok "request held during shutdown is allowed, not denied" \
+                                                  || bad "request was denied during shutdown"
+pkill -f '^sleep 20$' 2>/dev/null
+
+echo "== 20. hm is told about the deny mode (only when it is enabled)"
+start_daemon HM="$T/env-hm" OUT="$T/env.out" DENY_ON=partial COOLDOWN=45
+pac
+sleep 0.3
+[[ $(cat "$T/env.out" 2>/dev/null) == "partial 45" ]] && ok "hm gets HM_DENY_ON and HM_DENY_RETRY" \
+                                                       || bad "hm environment: '$(cat "$T/env.out" 2>/dev/null)'"
+stop_daemon
+rm -f "$T/env.out"
+start_daemon HM="$T/env-hm" OUT="$T/env.out" HM_DENY_ON=leftover HM_DENY_RETRY=1
+pac
+sleep 0.3
+[[ $(cat "$T/env.out" 2>/dev/null) == "unset unset" ]] && ok "without DENY_ON hm gets neither variable" \
+                                                        || bad "hm environment: '$(cat "$T/env.out" 2>/dev/null)'"
+stop_daemon
+
+echo "== 21. DENY_ON together with COOLDOWN=0 produces a warning at startup"
+start_daemon DENY_ON=failure
+grep -qF '<4>warning: DENY_ON is set with COOLDOWN=0' "$LOG" && ok "warning logged" || bad "warning missing"
 stop_daemon
 
 echo

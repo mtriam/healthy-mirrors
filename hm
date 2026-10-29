@@ -12,9 +12,16 @@ Options:
   --notify-test   send a test desktop notification and exit
   -h, --help      show this help message
 
+Exit status:
+  0   all mirror lists were processed
+  1   error, or no mirror list could be updated (nothing was changed)
+  2   some mirror lists were skipped (left unchanged), the others were updated
+
 Environment:
   HM_NOTIFY=auto|always|never   desktop notifications on errors
                                 (default: auto = only when not run in a terminal)
+  HM_DENY_ON, HM_DENY_RETRY     set by hm-daemon when its DENY_ON mode is enabled;
+                                only used to add a hint to warnings and notifications
 EOF
 }
 
@@ -157,9 +164,36 @@ desktop_notify() {
     return 0
 }
 
+# Hint for the user when hm-daemon blocks the programs that wait for this run (its DENY_ON
+# mode). hm-daemon passes HM_DENY_ON (failure|partial) and HM_DENY_RETRY (its cooldown in
+# seconds); outside of the daemon both are unset and nothing is printed.
+# $1 = severity of this run's outcome: failure (exit 1) | partial (exit 2). A partial result
+# blocks only in DENY_ON=partial; a failure blocks in both modes.
+deny_hint() {
+    local retry="${HM_DENY_RETRY:-}"
+
+    case "${HM_DENY_ON:-}:$1" in
+        failure:failure|partial:failure|partial:partial) ;;
+        *) return 0 ;;
+    esac
+
+    if [[ "$retry" =~ ^[0-9]+([.][0-9]+)?$ ]] &&
+       awk -v r="$retry" 'BEGIN { exit !(r > 0) }'; then
+        printf 'Programs waiting for this check were blocked (DENY_ON=%s). Starting the program again within %s s lets it continue with the existing mirror lists.' \
+            "$HM_DENY_ON" "$retry"
+    else
+        printf 'Programs waiting for this check were blocked (DENY_ON=%s) and stay blocked until a check succeeds.' \
+            "$HM_DENY_ON"
+    fi
+}
+
 die() {
+    local hint
+
     printf 'hm: %s\n' "$*" >&2
-    desktop_notify 'hm: mirror check failed' "$*"
+    hint=$(deny_hint failure)
+    [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
+    desktop_notify 'hm: mirror check failed' "$*${hint:+ $hint}"
     exit 1
 }
 
@@ -909,25 +943,31 @@ print_summary() {
 }
 
 # One warning and one notification for all skipped lists. $1 = all | partial
+# When run by hm-daemon with DENY_ON, the warning and the notification also say that the
+# waiting programs were blocked and how long they can be started again (deny_hint).
 report_skipped() {
-    local problems='' problem
+    local problems='' problem hint
 
     for problem in "${PROBLEMS[@]}"; do
         problems+="${problems:+; }$problem"
     done
 
     if [[ "$1" == all ]]; then
+        hint=$(deny_hint failure)
         printf '%sWARNING:%s no mirror list was updated: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
         desktop_notify 'hm: no mirror list updated' \
-            "No list was updated: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}."
+            "No list was updated: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}.${hint:+ $hint}"
     else
+        hint=$(deny_hint partial)
         printf '%sWARNING:%s left unchanged: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
         desktop_notify 'hm: some mirror lists not updated' \
-            "Left unchanged: ${problems}. The other lists were updated. Mirror summary (on/off): ${SUMMARY_PLAIN}."
+            "Left unchanged: ${problems}. The other lists were updated. Mirror summary (on/off): ${SUMMARY_PLAIN}.${hint:+ $hint}"
     fi
 }
 
-# Nothing can be updated: same outcome as a failed run.
+# Nothing can be updated: same outcome as a failed run (exit status 1).
 if [[ "$skipped_count" -eq "${#MIRRORLISTS[@]}" ]]; then
     print_summary
     report_skipped all
@@ -942,9 +982,12 @@ fi
 
 print_summary
 
-# Some lists were skipped, the others are done: warn, but this is not a failure.
+# Some lists were skipped, the others are done: warn and exit with status 2, so that callers
+# (the "up" function, hm-daemon) can tell this apart from a complete success (0) and from
+# a failure (1). This also applies to --dry-run, so that a preview agrees with a real run.
 if [[ "$skipped_count" -gt 0 ]]; then
     report_skipped partial
+    exit 2
 fi
 
 exit 0
