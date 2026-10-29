@@ -255,8 +255,8 @@ printf '#!/bin/sh\nsleep 1\nexit 3\n' > "$T/slowfail-hm"        # fails after a 
 printf '#!/bin/sh\necho "${HM_DENY_ON-unset} ${HM_DENY_RETRY-unset}" > "$OUT"\n' > "$T/env-hm"
 chmod +x "$T/partial-hm" "$T/slowfail-hm" "$T/env-hm"
 
-echo "== 13. hm exits with 2 (some lists skipped), DENY_ON off (default): nobody is denied"
-start_daemon HM="$T/partial-hm"
+echo "== 13. hm exits with 2 (some lists skipped), DENY_ON=off: nobody is denied"
+start_daemon HM="$T/partial-hm" DENY_ON=off
 denied && bad "request was denied although DENY_ON is off" || ok "request was released"
 grep -qF '<4>hm skipped some mirror lists (exit code 2)' "$LOG" && ! grep -q 'FAILED' "$LOG" \
     && ok "partial result logged as a warning, not as a failure" \
@@ -331,7 +331,7 @@ sleep 0.3
                                                        || bad "hm environment: '$(cat "$T/env.out" 2>/dev/null)'"
 stop_daemon
 rm -f "$T/env.out"
-start_daemon HM="$T/env-hm" OUT="$T/env.out" HM_DENY_ON=leftover HM_DENY_RETRY=1
+start_daemon HM="$T/env-hm" OUT="$T/env.out" DENY_ON=off HM_DENY_ON=leftover HM_DENY_RETRY=1
 pac
 sleep 0.3
 [[ $(cat "$T/env.out" 2>/dev/null) == "unset unset" ]] && ok "without DENY_ON hm gets neither variable" \
@@ -341,6 +341,12 @@ stop_daemon
 echo "== 21. DENY_ON together with COOLDOWN=0 produces a warning at startup"
 start_daemon DENY_ON=failure
 grep -qF '<4>warning: DENY_ON is set with COOLDOWN=0' "$LOG" && ok "warning logged" || bad "warning missing"
+stop_daemon
+
+echo "== 22. the default is DENY_ON=partial"
+start_daemon HM="$T/partial-hm"
+denied && ok "without DENY_ON a partial result is denied" || bad "default does not deny a partial result"
+grep -q 'DENY_ON=partial:' "$LOG" && ok "startup log names the active mode" || bad "startup log does not name DENY_ON"
 stop_daemon
 
 echo

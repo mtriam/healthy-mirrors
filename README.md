@@ -15,6 +15,8 @@ That's it! `hm-daemon` automatically checks mirror health before matching packag
 
 No aliases or wrappers are needed.
 
+**By default the daemon is strict** (`DENY_ON=partial`): if the mirror check fails or has to skip a list, the program that triggered it (`pacman -Syu`, `yay`, ...) is blocked instead of running with outdated lists. Starting it again within 60 seconds lets it through. See [Blocking mode](#blocking-mode-deny_on) to relax this or to turn it off.
+
 Example output of hm:  
 ![Example output of hm](docs/output.png)
 
@@ -122,7 +124,7 @@ git pull --ff-only
 - `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `--configure`, are kept.
-- **Behavior change in this version:** `hm` now exits with status `2` (instead of `0`) when it skipped some lists. With the default daemon settings nothing changes for you (the daemon lets programs continue, see below); the `up` function below no longer starts the upgrade in that case.
+- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default (`DENY_ON=partial`): a failed check, or a list that had to be skipped, stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. To get the previous behavior run `./install-daemon.sh --configure` and choose `off` (or `failure` to block only when the check failed as a whole).
 
 ## Uninstall
 
@@ -233,7 +235,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly. It also applies after a failed, partial or timed-out run. It is measured from the end of the run.
 - All intervals (cooldown, `hm` timeout, stop grace period, periodic check) use the monotonic clock, so a change of the system time (NTP correction after boot, resume from suspend) cannot shorten or extend them.
-- **By default the daemon guarantees a check before the operation, not that the check succeeds.** If `hm` fails, skips lists or times out, the waiting programs are still released and continue with the existing mirror lists. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run) and shows a desktop notification. To change this, use the [blocking mode](#blocking-mode-deny_on).
+- **By default (`DENY_ON=partial`) the daemon blocks the triggering programs when the check does not fully succeed.** If `hm` fails, times out or skips lists, they fail with `EPERM` (see [Blocking mode](#blocking-mode-deny_on)); a retry within the cooldown goes through. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run) and shows a desktop notification. With `DENY_ON=off` the daemon only guarantees a check before the operation, not that it succeeds: the waiting programs are always released and continue with the existing mirror lists.
 - The daemon logs the outcome by `hm`'s exit status:
   - `0`: `hm finished OK`,
   - `2` (some lists skipped, the others updated): `hm skipped some mirror lists (exit code 2)` at warning priority. This is not logged as a failure,
@@ -248,15 +250,15 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 ### Blocking mode (`DENY_ON`)
 
-By default nothing is ever blocked for good: after `hm` the held programs always continue, even if the lists could not be brought up to date. `DENY_ON` changes that for people who want **only upgrades on up-to-date lists** to run. It has three levels:
+`DENY_ON` decides what happens to the programs that wait for `hm` when the lists could not be brought up to date. The default, `partial`, makes sure that **only upgrades on up-to-date lists** run. It has three levels:
 
 | `DENY_ON` | `hm` exit `0` | `hm` exit `2` (some lists skipped) | `hm` exit `1`, timeout, `hm` cannot be started |
 |---|---|---|---|
-| `off` (default) | continue | continue | continue |
+| `off` | continue | continue | continue |
 | `failure` | continue | continue | **blocked** |
-| `partial` | continue | **blocked** | **blocked** |
+| `partial` (default) | continue | **blocked** | **blocked** |
 
-`failure` blocks only when the check as a whole failed (no list could be updated, API unreachable, ...). `partial` is the strict level: a single skipped list is enough to block. Enable it with `./install-daemon.sh --configure` or with a systemd drop-in:
+`failure` blocks only when the check as a whole failed (no list could be updated, API unreachable, ...). `partial` is the strict level: a single skipped list is enough to block. `off` never blocks. If one list is permanently skipped (for example because the API data for it is wrong), `partial` makes every first start fail once; `failure` is the better choice then. Change it with `./install-daemon.sh --configure` or with a systemd drop-in:
 
 ```bash
 sudo systemctl edit hm-daemon.service
@@ -264,7 +266,7 @@ sudo systemctl edit hm-daemon.service
 
 ```ini
 [Service]
-Environment="DENY_ON=partial"
+Environment="DENY_ON=failure"
 ```
 
 What "blocked" means: the daemon answers the waiting `open()` of `/etc/pacman.conf` with `FAN_DENY`, so it fails with `EPERM` and the program stops before it reads any mirror list. `pacman` reports something like `error: could not open file /etc/pacman.conf: Operation not permitted`. That message alone does not say why, so the reason is shown elsewhere (see below).
@@ -327,7 +329,7 @@ Environment="HELPERS_RE=yay|paru"
 | `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it (≥ 0). Replacements are normally detected immediately via inotify |
 | `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through (integer ≥ 1) |
 | `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped (≥ 0) |
-| `DENY_ON` | `off` | `off`, `failure` or `partial`: when to block the programs that triggered a `hm` run, see [Blocking mode](#blocking-mode-deny_on) |
+| `DENY_ON` | `partial` | `off`, `failure` or `partial`: when to block the programs that triggered a `hm` run, see [Blocking mode](#blocking-mode-deny_on) |
 
 Numbers must be finite; a value that does not match its constraint makes the service fail to start with a message such as `invalid MAX_HELD='0': must be an integer >= 1`. An unknown `DENY_ON` value is rejected the same way (`invalid DENY_ON='abc': must be one of off, failure, partial`).
 
@@ -407,7 +409,7 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 10 | The log names every process that opens the file, but shows command lines only for `pacman`, AUR helpers and `shelly` |
 | 11 | Cooldown: a fresh daemon starts `hm` for the first request, a second request within the cooldown does not start it again |
 | 12 | `hm` exits with an error: the request is released and the failure is logged at error priority |
-| 13 | `hm` exits with `2` and `DENY_ON` is off: the request is released, logged as a warning and not as a failure |
+| 13 | `hm` exits with `2` and `DENY_ON=off`: the request is released, logged as a warning and not as a failure |
 | 14 | `DENY_ON=failure`: exit `2` is let through, a failure is denied (`EPERM`) and logged |
 | 15 | `DENY_ON=partial`: both exit `2` and a failure are denied |
 | 16 | Only triggering processes are denied: a `cat` that was held during the same run is allowed and reads the file (`denying 1 of 2`) |
@@ -416,8 +418,9 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 19 | Stopping the daemon with a held request never denies it |
 | 20 | `hm` receives `HM_DENY_ON` and `HM_DENY_RETRY` in deny mode, and neither otherwise (also not inherited from the daemon's environment) |
 | 21 | `DENY_ON` together with `COOLDOWN=0` produces a warning at startup |
+| 22 | The default is `DENY_ON=partial`: without the variable a partial result is denied and the startup log names the mode |
 
-A successful run ends with `passed: 50, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16 and 19. If a single case fails on a heavily loaded system, run the script again before investigating.
+A successful run ends with `passed: 52, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16 and 19. If a single case fails on a heavily loaded system, run the script again before investigating.
 
 The script does **not** cover `hm` itself (mirror evaluation, transactional updates, exit status `0`/`1`/`2`), desktop notifications, the systemd sandbox or the installers (including `--configure`). Check those with:
 
@@ -429,7 +432,7 @@ sudo hm --clean                   # removes the markers again
 journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Ss foo`
 ```
 
-To try the blocking mode by hand, set `DENY_ON=partial` in a drop-in, make `hm` fail (for example by going offline), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass.
+To try the blocking mode by hand (it is on by default), make `hm` fail (for example by going offline), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass.
 
 Installer rollback (installs a deliberately broken daemon and checks that the previous version returns):
 

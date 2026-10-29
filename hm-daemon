@@ -9,11 +9,11 @@ periodic check (RECHECK) is kept as a safety net.
 All intervals (cooldown, timeouts, grace period, periodic check) use the monotonic
 clock, so changes of the system time cannot shorten or extend them.
 
-By default every held program is allowed to continue when hm is done, whatever the
-result. With DENY_ON=failure|partial the daemon answers FAN_DENY instead (the open()
-fails with EPERM) to the programs that would trigger hm themselves, when the run ended
-with a failure (exit code other than 0 and 2, timeout, hm could not be started) or, with
-DENY_ON=partial, also when hm skipped some lists (exit code 2). Other processes that
+By default (DENY_ON=partial) the daemon answers FAN_DENY (the open() fails with EPERM) to
+the programs that would trigger hm themselves, when the run ended with a failure (exit
+code other than 0 and 2, timeout, hm could not be started) or when hm skipped some lists
+(exit code 2). DENY_ON=failure denies only the failures, DENY_ON=off never denies: every
+held program is then allowed to continue when hm is done, whatever the result. Other processes that
 happen to be held are always allowed. A program started again within the cooldown is
 let through (no new hm run, no denial).
 
@@ -34,11 +34,11 @@ HM_TIMEOUT = COOLDOWN = RECHECK = STOP_GRACE = 0.0
 MAX_HELD = 0
 WATCH = []
 SHELLY_RE = HELPERS_RE = None
-DENY_ON = "off"
-DENY_LEVEL = 0
+DENY_ON = "partial"
+DENY_LEVEL = 2
 
-# DENY_ON values: off = never deny; failure = deny when hm failed; partial = also deny when
-# hm skipped some lists
+# DENY_ON values: off = never deny; failure = deny when hm failed; partial (default) = also
+# deny when hm skipped some lists
 DENY_LEVELS = {"off": 0, "failure": 1, "partial": 2}
 
 # exit codes of hm (see hm --help)
@@ -143,8 +143,8 @@ def load_config():
     SHELLY_RE = env_regex("SHELLY_RE", r"shelly.*")
     # trigger only when run bare/with a package name, or with a sync/upgrade operation
     HELPERS_RE = env_regex("HELPERS_RE", r"yay|paru|pikaur|trizen|octopi")
-    # off (default) | failure | partial: when to deny the programs that triggered a hm run
-    DENY_ON = env_choice("DENY_ON", "off", DENY_LEVELS)
+    # partial (default) | failure | off: when to deny the programs that triggered a hm run
+    DENY_ON = env_choice("DENY_ON", "partial", DENY_LEVELS)
     DENY_LEVEL = DENY_LEVELS[DENY_ON]
 
 

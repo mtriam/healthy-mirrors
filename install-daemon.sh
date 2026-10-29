@@ -73,7 +73,7 @@ if [[ $ACTION == configure ]]; then
 
     CFG_ORDER=(DENY_ON COOLDOWN HM_TIMEOUT HELPERS_RE SHELLY_RE WATCH MAX_HELD STOP_GRACE RECHECK)
     declare -A CFG_DEF=(
-        [DENY_ON]=off
+        [DENY_ON]=partial
         [COOLDOWN]=60
         [HM_TIMEOUT]=30
         [HELPERS_RE]='yay|paru|pikaur|trizen|octopi'
