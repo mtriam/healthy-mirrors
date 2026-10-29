@@ -121,7 +121,7 @@ git pull --ff-only
 - `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755` and can be run repeatedly.
 - `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
-- Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`) are kept.
+- Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `--configure`, are kept.
 - **Behavior change in this version:** `hm` now exits with status `2` (instead of `0`) when it skipped some lists. With the default daemon settings nothing changes for you (the daemon lets programs continue, see below); the `up` function below no longer starts the upgrade in that case.
 
 ## Uninstall
@@ -134,7 +134,7 @@ hm --clean
 sudo rm /usr/local/bin/hm
 ```
 
-`--remove` stops and removes `hm-daemon.service` and `/usr/local/bin/hm-daemon`. A drop-in created with `systemctl edit` is left in `/etc/systemd/system/hm-daemon.service.d/`; remove it manually if needed.
+`--remove` stops and removes `hm-daemon.service` and `/usr/local/bin/hm-daemon`. Drop-ins (made with `--configure` or `systemctl edit`) are left in `/etc/systemd/system/hm-daemon.service.d/`, so your settings survive a later install; remove the directory manually if needed.
 
 ## Usage
 
@@ -256,7 +256,7 @@ By default nothing is ever blocked for good: after `hm` the held programs always
 | `failure` | continue | continue | **blocked** |
 | `partial` | continue | **blocked** | **blocked** |
 
-`failure` blocks only when the check as a whole failed (no list could be updated, API unreachable, ...). `partial` is the strict level: a single skipped list is enough to block. Enable it with a systemd drop-in:
+`failure` blocks only when the check as a whole failed (no list could be updated, API unreachable, ...). `partial` is the strict level: a single skipped list is enough to block. Enable it with `./install-daemon.sh --configure` or with a systemd drop-in:
 
 ```bash
 sudo systemctl edit hm-daemon.service
@@ -294,7 +294,17 @@ Known limitations of blocking mode:
 
 ### Configuration
 
-Set environment variables with a systemd drop-in:
+The easy way is the interactive setup, which explains every option, offers the current value as the default and validates your answers with the same rules as the daemon:
+
+```bash
+./install-daemon.sh --configure
+```
+
+For each option it shows a colored description (with a table of values for `DENY_ON`) and an overview and summary table. It asks for `DENY_ON`, `COOLDOWN`, `HM_TIMEOUT`, `HELPERS_RE`, `SHELLY_RE`, `WATCH`, `MAX_HELD`, `STOP_GRACE` and `RECHECK` (press Enter to keep the value in brackets, type `default` to restore the built-in default), shows a summary and applies it only after you confirm. The answers are written to `/etc/systemd/system/hm-daemon.service.d/hm-config.conf` (only the values that differ from the defaults; if none do, the file is removed), then the service is restarted. **If the service does not start with the new settings, the previous settings are restored.** You can run it again at any time; the current values are read back from that file. `HM` (the path of the script) is not offered, because the installer verifies that path and generates the sandbox for it. The service must be installed first, and a terminal is required.
+
+Settings made by hand with `systemctl edit` (`override.conf`) sort after `hm-config.conf` and win over it; `--configure` warns if such a file sets the same options.
+
+To set variables by hand instead, use a systemd drop-in:
 
 ```bash
 sudo systemctl edit hm-daemon.service
@@ -409,7 +419,7 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 
 A successful run ends with `passed: 50, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16 and 19. If a single case fails on a heavily loaded system, run the script again before investigating.
 
-The script does **not** cover `hm` itself (mirror evaluation, transactional updates, exit status `0`/`1`/`2`), desktop notifications, the systemd sandbox or the installers. Check those with:
+The script does **not** cover `hm` itself (mirror evaluation, transactional updates, exit status `0`/`1`/`2`), desktop notifications, the systemd sandbox or the installers (including `--configure`). Check those with:
 
 ```bash
 hm --dry-run; echo "exit=$?"     # what a run would change, nothing is written; 0, 1 or 2
@@ -438,7 +448,7 @@ rm -f /tmp/hm-daemon-broken
 | `hm` | The mirror health check |
 | `hm-daemon` | The optional fanotify service that runs `hm` before `pacman`/`shelly` read the mirror lists |
 | `install.sh` | Installs `hm` to `/usr/local/bin` |
-| `install-daemon.sh` | Installs, updates (with rollback) or removes (`--remove`) the hardened `hm-daemon.service` |
+| `install-daemon.sh` | Installs, updates (with rollback), configures interactively (`--configure`) or removes (`--remove`) the hardened `hm-daemon.service` |
 | `test-hm-daemon.sh` | Tests for the daemon |
 | `docs/` | Images used in this README |
 

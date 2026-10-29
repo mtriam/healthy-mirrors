@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# install-daemon.sh - install / remove the hardened hm-daemon systemd service
+# install-daemon.sh - install / configure / remove the hardened hm-daemon systemd service
 #
 # Installs the LOCAL hm-daemon file (next to this script, or SRC=/path/to/hm-daemon).
 # This script never downloads anything.
@@ -20,14 +20,20 @@ BIN=/usr/local/bin/hm-daemon
 UNIT=/etc/systemd/system/hm-daemon.service
 SVC=hm-daemon.service
 HM=/usr/local/bin/hm
+# settings made with --configure live in their own drop-in; "systemctl edit" files
+# (override.conf) sort after it and therefore win
+DROPIN_DIR=$UNIT.d
+DROPIN=$DROPIN_DIR/hm-config.conf
 
-if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; D=$'\e[2m'; N=$'\e[0m'; else G=; R=; Y=; D=; N=; fi
+if [[ -t 1 && -z "${NO_COLOR:-}" ]]; then G=$'\e[32m'; R=$'\e[31m'; Y=$'\e[33m'; C=$'\e[36m'; D=$'\e[2m'; B=$'\e[1m'; N=$'\e[0m'; else G=; R=; Y=; C=; D=; B=; N=; fi
 ok()   { printf '%s✔%s %-10s %s\n' "$G" "$N" "$1" "$2"; }
 warn() { printf '%s!%s %s\n' "$Y" "$N" "$*" >&2; }
 die()  { printf '%s✘%s %s\n' "$R" "$N" "$*" >&2; exit 1; }
 usage() {
-    echo "Usage: ${SELF##*/} [--remove|--uninstall|-r] [-h]"
+    echo "Usage: ${SELF##*/} [--configure|-c] [--remove|--uninstall|-r] [-h]"
     echo "  (no option)  install/update $SVC from the local file \$SRC (default: ${LOCAL_SRC})"
+    echo "  --configure  interactively set the daemon options (cooldown, blocking mode, ...)"
+    echo "               and restart the service; needs the service to be installed"
     echo "  --remove     stop and remove the service and the binary"
     echo "Repository: $REPOSITORY_URL"
 }
@@ -35,6 +41,7 @@ usage() {
 ACTION=install
 case "${1:-}" in
     "")                        ;;
+    -c|--configure)            ACTION=configure ;;
     -r|--remove|--uninstall)   ACTION=remove ;;
     -h|--help)                 usage; exit 0 ;;
     *)                         usage >&2; exit 1 ;;
@@ -50,7 +57,362 @@ if [[ $ACTION == remove ]]; then
     rm -f -- "$UNIT" "$BIN"
     systemctl daemon-reload
     ok removed "$SVC and $BIN"
-    if [[ -d $UNIT.d ]]; then warn "drop-in directory left in place: $UNIT.d"; fi
+    if [[ -d $UNIT.d ]]; then warn "drop-in directory left in place (your settings are kept for a later install): $UNIT.d"; fi
+    exit 0
+fi
+
+# ----------------------------------------------------------------------------- configure
+# Interactive setup of the daemon options (see README, "Configuration"). The answers are
+# written to a drop-in (only the values that differ from the built-in defaults), then the
+# service is restarted; if it does not come up, the previous settings are restored.
+# Options that are not offered: HM (the path of hm is verified by the installer and the
+# sandbox is generated for it; change it only together with a re-install).
+if [[ $ACTION == configure ]]; then
+    [[ -t 0 && -t 1 ]] || die "--configure is interactive and needs a terminal"
+    [[ -e $UNIT && -e $BIN ]] || die "$SVC is not installed - run ${SELF##*/} without options first"
+
+    CFG_ORDER=(DENY_ON COOLDOWN HM_TIMEOUT HELPERS_RE SHELLY_RE WATCH MAX_HELD STOP_GRACE RECHECK)
+    declare -A CFG_DEF=(
+        [DENY_ON]=off
+        [COOLDOWN]=60
+        [HM_TIMEOUT]=30
+        [HELPERS_RE]='yay|paru|pikaur|trizen|octopi'
+        [SHELLY_RE]='shelly.*'
+        [WATCH]=/etc/pacman.conf
+        [MAX_HELD]=256
+        [STOP_GRACE]=5
+        [RECHECK]=600
+    )
+    declare -A CFG_CUR=() CFG_NEW=()
+
+    # what each option does (the allowed values are shown separately, see cfg_allowed)
+    cfg_describe() {
+        case $1 in
+            DENY_ON) cat <<'EOF'
+  What happens to pacman / yay / shelly when the mirror check does not succeed.
+  A blocked program fails at startup with "Operation not permitted". Starting it
+  again within COOLDOWN seconds lets it through with the existing mirror lists.
+EOF
+            ;;
+            COOLDOWN) cat <<'EOF'
+  Seconds after a hm run during which no new run is started (also after a failed
+  run). In blocking mode this is the window in which a blocked program can be
+  started again with the existing lists. 0 = no cooldown (then a blocked program
+  stays blocked until hm succeeds).
+EOF
+            ;;
+            HM_TIMEOUT) cat <<'EOF'
+  Seconds before a running hm is killed. The waiting programs are then released
+  (or blocked, see DENY_ON). Raise it on a slow connection.
+EOF
+            ;;
+            HELPERS_RE) cat <<'EOF'
+  AUR helpers / frontends that trigger hm, when started without options or with a
+  sync/upgrade operation. The expression is case-insensitive and must match the
+  whole process name.
+EOF
+            ;;
+            SHELLY_RE) cat <<'EOF'
+  Programs that ALWAYS trigger hm when they open the watched file (e.g. a program
+  that only ever syncs). The expression is case-insensitive and must match the
+  whole process name.
+EOF
+            ;;
+            WATCH) cat <<'EOF'
+  Files the daemon watches: when a trigger program opens one of them, hm runs first.
+EOF
+            ;;
+            MAX_HELD) cat <<'EOF'
+  Maximum number of open() calls held while hm runs; further ones are let through
+  (also in blocking mode), so a flood of processes cannot exhaust the daemon.
+EOF
+            ;;
+            STOP_GRACE) cat <<'EOF'
+  Seconds a running hm may finish when the service is stopped or restarted. After
+  that it is killed. Held programs are always released on a stop, never blocked.
+EOF
+            ;;
+            RECHECK) cat <<'EOF'
+  Interval (seconds) of the safety-net check that every watched file is still
+  monitored. Replaced files are normally noticed immediately; this only matters for
+  watched symlinks.
+EOF
+            ;;
+        esac
+    }
+
+    # one line for the overview table
+    cfg_short() {
+        case $1 in
+            DENY_ON)    echo "block programs when the mirror check fails" ;;
+            COOLDOWN)   echo "seconds between hm runs; retry window when blocked" ;;
+            HM_TIMEOUT) echo "seconds before a running hm is killed" ;;
+            HELPERS_RE) echo "AUR helpers that trigger hm (regex)" ;;
+            SHELLY_RE)  echo "programs that always trigger hm (regex)" ;;
+            WATCH)      echo "files whose opening triggers hm" ;;
+            MAX_HELD)   echo "max. open() calls held while hm runs" ;;
+            STOP_GRACE) echo "seconds hm may finish when the service stops" ;;
+            RECHECK)    echo "safety-net check interval (0 = off)" ;;
+        esac
+    }
+
+    cfg_allowed() {
+        case $1 in
+            DENY_ON)                      echo "off | failure | partial" ;;
+            COOLDOWN|RECHECK|STOP_GRACE)  echo "a number >= 0 (seconds), e.g. 60" ;;
+            HM_TIMEOUT)                   echo "a number > 0 (seconds), e.g. 30" ;;
+            MAX_HELD)                     echo "an integer >= 1" ;;
+            HELPERS_RE|SHELLY_RE)         echo "a regular expression, e.g. yay|paru" ;;
+            WATCH)                        echo "absolute paths separated by \":\", no spaces" ;;
+        esac
+    }
+
+    # --- tables -------------------------------------------------------------------
+    # horizontal rule: tbl_line LEFT MID RIGHT width...
+    tbl_line() {
+        local left=$1 mid=$2 right=$3 out seg w
+        shift 3
+        out=$left
+        for w in "$@"; do
+            printf -v seg '%*s' $((w + 2)) ''
+            out+=${seg// /─}$mid
+        done
+        out=${out%"$mid"}$right
+        printf '  %s%s%s\n' "$D" "$out" "$N"
+    }
+
+    # Draws a table. Every argument is one row, cells separated by tabs (no empty cells);
+    # the first row is the header. A cell may start with @g: @y: @c: @d: @b: @r: to be
+    # shown in green, yellow, cyan, dim, bold or red.
+    tbl() {
+        local -a W=() cells=()
+        local row i t col rowno=0
+        for row in "$@"; do
+            IFS=$'\t' read -r -a cells <<<"$row"
+            for i in "${!cells[@]}"; do
+                t=${cells[$i]}
+                if [[ $t =~ ^@[gycdbr]: ]]; then t=${t:3}; fi
+                if (( ${#t} > ${W[$i]:-0} )); then W[$i]=${#t}; fi
+            done
+        done
+        tbl_line ┌ ┬ ┐ "${W[@]}"
+        for row in "$@"; do
+            IFS=$'\t' read -r -a cells <<<"$row"
+            printf '  %s│%s' "$D" "$N"
+            for i in "${!W[@]}"; do
+                t=${cells[$i]:-}
+                col=
+                if [[ $t =~ ^@([gycdbr]): ]]; then
+                    case ${BASH_REMATCH[1]} in
+                        g) col=$G ;; y) col=$Y ;; c) col=$C ;; d) col=$D ;; b) col=$B ;; r) col=$R ;;
+                    esac
+                    t=${t:3}
+                fi
+                if (( rowno == 0 )); then col=$B; fi
+                printf ' %s%-*s%s %s│%s' "$col" "${W[$i]}" "$t" "${col:+$N}" "$D" "$N"
+            done
+            printf '\n'
+            if (( rowno == 0 )); then tbl_line ├ ┼ ┤ "${W[@]}"; fi
+            rowno=$((rowno + 1))
+        done
+        tbl_line └ ┴ ┘ "${W[@]}"
+    }
+
+    # prints a message and fails if the value is not acceptable (the same rules as in hm-daemon)
+    cfg_validate() {
+        local name=$1 v=$2 p
+        if [[ -z $v ]]; then echo "must not be empty"; return 1; fi
+        if [[ $v == *[[:cntrl:]]* || $v == *'"'* || $v == *'\'* ]]; then
+            echo "must not contain control characters, double quotes or backslashes"; return 1
+        fi
+        case $name in
+            DENY_ON)
+                case $v in off|failure|partial) ;; *) echo "must be one of: off, failure, partial"; return 1 ;; esac ;;
+            COOLDOWN|RECHECK|STOP_GRACE)
+                [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "must be a number >= 0 (for example 60 or 0.5)"; return 1; } ;;
+            HM_TIMEOUT)
+                [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] && awk -v x="$v" 'BEGIN { exit !(x > 0) }' ||
+                    { echo "must be a number > 0 (for example 30)"; return 1; } ;;
+            MAX_HELD)
+                [[ $v =~ ^[0-9]+$ ]] && (( 10#$v >= 1 )) || { echo "must be an integer >= 1"; return 1; } ;;
+            HELPERS_RE|SHELLY_RE)
+                python3 -c 'import re, sys; re.compile(sys.argv[1], re.I)' "$v" 2>/dev/null ||
+                    { echo "is not a valid regular expression"; return 1; } ;;
+            WATCH)
+                [[ $v != *[[:space:]]* ]] || { echo "must not contain whitespace"; return 1; }
+                local IFS=:
+                for p in $v; do
+                    [[ -z $p ]] && continue
+                    [[ $p == /* ]] || { echo "paths must be absolute: $p"; return 1; }
+                done ;;
+        esac
+        return 0
+    }
+
+    # current values: from the drop-in written by an earlier --configure, else the defaults
+    for name in "${CFG_ORDER[@]}"; do
+        val=
+        if [[ -f $DROPIN ]]; then
+            val=$(sed -n "s/^Environment=\"$name=\(.*\)\"\$/\1/p" "$DROPIN" | tail -n1)
+            val=${val//%%/%}
+        fi
+        CFG_CUR[$name]=${val:-${CFG_DEF[$name]}}
+    done
+
+    printf '%shm-daemon configuration%s\n' "$B" "$N"
+    printf '  Press %sEnter%s to keep the value in [brackets]; type %sdefault%s to restore the built-in\n' "$B" "$N" "$B" "$N"
+    printf '  default. Nothing is changed until you confirm at the end (Ctrl-C aborts).\n'
+    if [[ -f $DROPIN ]]; then
+        printf '  Current values are taken from %s.\n' "$DROPIN"
+    else
+        printf '  No earlier settings found: the current values are the built-in defaults.\n'
+    fi
+    echo
+    rows=($'Option\tCurrent\tDefault\tWhat it controls')
+    for name in "${CFG_ORDER[@]}"; do
+        cur=${CFG_CUR[$name]}
+        if [[ $cur != "${CFG_DEF[$name]}" ]]; then cur="@y:$cur"; fi
+        rows+=("@c:$name"$'\t'"$cur"$'\t'"${CFG_DEF[$name]}"$'\t'"$(cfg_short "$name")")
+    done
+    tbl "${rows[@]}"
+    printf '  %sYellow%s = differs from the built-in default.\n' "$Y" "$N"
+
+    for name in "${CFG_ORDER[@]}"; do
+        echo
+        printf '%s%s▌ %s%s  %sdefault: %s%s\n' "$C" "$B" "$name" "$N" "$D" "${CFG_DEF[$name]}" "$N"
+        cfg_describe "$name"
+        if [[ $name == DENY_ON ]]; then
+            echo
+            tbl $'Value\tEffect when the check does not succeed' \
+                $'@g:off\tnever block: programs always continue, even with outdated lists' \
+                $'@y:failure\tblock when the check as a whole failed (no list updated, API down, timeout)' \
+                $'@r:partial\tstrict: also block when some list was skipped (left as it was)'
+        else
+            printf '  %sAllowed:%s %s\n' "$C" "$N" "$(cfg_allowed "$name")"
+        fi
+        echo
+        while :; do
+            prompt=$(printf '  %s%s%s [%s%s%s]: ' "$B" "$name" "$N" "$Y" "${CFG_CUR[$name]}" "$N")
+            read -r -p "$prompt" ans || die "input closed; nothing was changed"
+            case $ans in
+                "")       ans=${CFG_CUR[$name]} ;;
+                default)  ans=${CFG_DEF[$name]} ;;
+            esac
+            if msg=$(cfg_validate "$name" "$ans"); then
+                CFG_NEW[$name]=$ans
+                break
+            fi
+            warn "$name $msg"
+        done
+    done
+
+    echo
+    printf '%sSummary%s\n' "$B" "$N"
+    changed_defaults=0
+    rows=($'Option\tNew value\tDefault\tChange')
+    for name in "${CFG_ORDER[@]}"; do
+        new=${CFG_NEW[$name]}
+        if [[ $new != "${CFG_DEF[$name]}" ]]; then
+            changed_defaults=$((changed_defaults + 1))
+            new="@y:$new"
+        fi
+        if [[ ${CFG_NEW[$name]} != "${CFG_CUR[$name]}" ]]; then chg='@g:changed'; else chg='@d:unchanged'; fi
+        rows+=("@c:$name"$'\t'"$new"$'\t'"${CFG_DEF[$name]}"$'\t'"$chg")
+    done
+    tbl "${rows[@]}"
+    printf '  %sYellow%s = differs from the built-in default, %sgreen%s = changed in this session.\n' "$Y" "$N" "$G" "$N"
+    if [[ ${CFG_NEW[DENY_ON]} != off && ${CFG_NEW[COOLDOWN]} =~ ^0+([.]0*)?$ ]]; then
+        warn "DENY_ON with COOLDOWN=0: a blocked program has no window to start again with the existing lists"
+    fi
+    names_re=$(IFS='|'; echo "${CFG_ORDER[*]}")
+    for f in "$DROPIN_DIR"/*.conf; do
+        [[ -e $f && $f != "$DROPIN" ]] || continue
+        if grep -qE "^[[:space:]]*Environment=.*\b($names_re)=" "$f"; then
+            warn "$f also sets some of these options; the file that sorts last wins ($f is read after $DROPIN if its name sorts later)"
+        fi
+    done
+
+    echo
+    read -r -p "Apply these settings and restart $SVC? [Y/n] " ans || die "input closed; nothing was changed"
+    case ${ans,,} in ""|y|yes) ;; *) echo "Nothing changed."; exit 0 ;; esac
+
+    # remember the current state for a rollback
+    BACKUP=$(mktemp /run/hm-config.XXXXXX) || die "cannot create a temporary file in /run"
+    trap 'rm -f -- "$BACKUP" "$DROPIN.new"' EXIT
+    HAD_DROPIN=0
+    if [[ -f $DROPIN ]]; then HAD_DROPIN=1; cp -a -- "$DROPIN" "$BACKUP"; fi
+    WAS_ACTIVE=0
+    if systemctl is-active --quiet "$SVC"; then WAS_ACTIVE=1; fi
+
+    write_dropin() {
+        local n tmp=$DROPIN.new
+        if (( changed_defaults == 0 )); then
+            rm -f -- "$DROPIN"
+            rmdir -- "$DROPIN_DIR" 2>/dev/null || true
+            return 0
+        fi
+        install -d -o root -g root -m 0755 -- "$DROPIN_DIR" || return 1
+        {
+            echo "# Written by install-daemon.sh --configure (run it again to change the values)."
+            echo "# Only options that differ from the built-in defaults are listed."
+            echo "[Service]"
+            for n in "${CFG_ORDER[@]}"; do
+                [[ ${CFG_NEW[$n]} != "${CFG_DEF[$n]}" ]] || continue
+                # "%" is a specifier character in unit files
+                printf 'Environment="%s=%s"\n' "$n" "${CFG_NEW[$n]//%/%%}"
+            done
+        } > "$tmp" || return 1
+        chmod 0644 -- "$tmp" || return 1
+        mv -f -- "$tmp" "$DROPIN" || return 1
+    }
+
+    restore_dropin() {
+        if (( HAD_DROPIN )); then
+            install -d -o root -g root -m 0755 -- "$DROPIN_DIR" 2>/dev/null || true
+            cp -a -- "$BACKUP" "$DROPIN.new" && mv -f -- "$DROPIN.new" "$DROPIN" ||
+                warn "could not restore $DROPIN"
+        else
+            rm -f -- "$DROPIN"
+            rmdir -- "$DROPIN_DIR" 2>/dev/null || true
+        fi
+        systemctl daemon-reload || true
+    }
+
+    apply_config() {
+        write_dropin || return 1
+        systemctl daemon-reload || return 1
+        (( WAS_ACTIVE )) || return 0                # not running: the settings apply at the next start
+        systemctl restart "$SVC" || return 1
+        sleep 2
+        local restarts
+        restarts=$(systemctl show -p NRestarts --value "$SVC" 2>/dev/null || true)
+        if ! systemctl is-active --quiet "$SVC" || [[ ${restarts:-0} != 0 ]]; then
+            journalctl -u "$SVC" -n 15 --no-pager >&2 || true
+            return 1
+        fi
+        return 0
+    }
+
+    if ! apply_config; then
+        warn "the service did not start with the new settings; restoring the previous ones"
+        restore_dropin
+        if (( WAS_ACTIVE )); then
+            systemctl restart "$SVC" 2>/dev/null || warn "the service did not start with the previous settings either"
+        fi
+        die "configuration failed and was rolled back (see messages above)"
+    fi
+
+    if (( changed_defaults == 0 )); then
+        ok configured "all options at their defaults (drop-in removed)"
+    else
+        ok configured "$changed_defaults option(s) differ from the defaults ($DROPIN)"
+    fi
+    if (( WAS_ACTIVE )); then
+        ok service "$SVC restarted with the new settings"
+    else
+        warn "$SVC is not running; the settings apply when it is started"
+    fi
+    printf '\n%sLogs:%s   journalctl -fu %s\n%sAgain:%s  %s --configure\n' "$D" "$N" "$SVC" "$D" "$N" "$SELF"
     exit 0
 fi
 
@@ -287,5 +649,5 @@ if (( ${#RO_DIRS[@]} > 0 )); then HARDENING+="; read-only inside: $(join_list "$
 ok installed "$BIN (root:root 0755)"
 ok service   "$SVC active, enabled at boot"
 ok hardening "$HARDENING"
-printf '\n%sLogs:%s   journalctl -fu %s\n%sRemove:%s %s --remove\n%sRepo:%s   %s\n' \
-    "$D" "$N" "$SVC" "$D" "$N" "$SELF" "$D" "$N" "$REPOSITORY_URL"
+printf '\n%sLogs:%s   journalctl -fu %s\n%sConfig:%s %s --configure   (cooldown, blocking mode, ...)\n%sRemove:%s %s --remove\n%sRepo:%s   %s\n' \
+    "$D" "$N" "$SVC" "$D" "$N" "$SELF" "$D" "$N" "$SELF" "$D" "$N" "$REPOSITORY_URL"
