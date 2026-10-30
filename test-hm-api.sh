@@ -36,7 +36,7 @@ HM=$(readlink -f "${HM:-${SELF%/*}/hm}")
     exit 1
 }
 
-for tool in curl jq sed grep cmp diff sort awk; do
+for tool in curl jq sed grep cmp diff sort awk uniq; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "missing tool: $tool" >&2
         exit 1
@@ -65,8 +65,8 @@ ARCH=$(const ARCH_API)
 T=$(mktemp -d /tmp/hmapitest.XXXXXX)
 LOG=$T/curl.log
 
-RUNS=20
-REQUEST_DELAY=0.5
+RUNS=20             # downloads of each real API in test 8
+REQUEST_DELAY=0.5   # pause between two downloads in test 8
 
 PASS=0
 FAIL=0
@@ -379,6 +379,7 @@ fi
 # Part 3: measure real API response times
 # ---------------------------------------------------------------------------
 
+# median of the numbers in file $1 ("n/a" if there are none)
 median() {
     sort -n "$1" | awk '
         { a[NR] = $1 }
@@ -394,6 +395,15 @@ median() {
     '
 }
 
+# smallest of the numbers in file $1 ("n/a" if there are none)
+fastest() {
+    sort -n "$1" | awk '
+        NR == 1 { printf "%.6f\n", $1; found = 1 }
+        END { if (!found) print "n/a" }
+    '
+}
+
+# seconds -> "123.4 ms"
 ms() {
     awk -v t="$1" 'BEGIN {
         if (t == "n/a") print "n/a"
@@ -406,11 +416,11 @@ echo "== 8. response time of the two real APIs ($RUNS downloads each, alternatin
 if [[ $OFFLINE -eq 1 ]]; then
     skip "--offline"
 else
-    : > "$T/timings"
-    : > "$T/primary-ttfb"
-    : > "$T/primary-total"
-    : > "$T/fallback-ttfb"
-    : > "$T/fallback-total"
+    for which in primary fallback; do
+        : > "$T/$which-ttfb"
+        : > "$T/$which-total"
+        : > "$T/$which-errors"
+    done
 
     # Warm-up: one request to each API, not included in the measurements.
     for url in "$PRIMARY" "$FALLBACK"; do
@@ -419,7 +429,7 @@ else
         sleep "$REQUEST_DELAY"
     done
 
-    # Alternate request order and keep a short delay between requests.
+    # Alternate the request order and keep a short delay between requests.
     for ((round = 1; round <= RUNS; round++)); do
         if (( round % 2 )); then
             order="primary fallback"
@@ -436,76 +446,58 @@ else
 
             metrics=$(curl -sS --connect-timeout 5 --max-time 10 \
                 -o /dev/null \
-                -w '%{http_code}\t%{time_namelookup}\t%{time_connect}\t%{time_appconnect}\t%{time_starttransfer}\t%{time_total}\t%{size_download}' \
+                -w '%{http_code}\t%{time_starttransfer}\t%{time_total}\t%{size_download}' \
                 "$url" 2>/dev/null)
             rc=$?
 
-            printf '%s\t%s\t%d\n' "$which" "$metrics" "$rc" >> "$T/timings"
+            IFS=$'\t' read -r http ttfb total bytes <<< "$metrics"
 
-            IFS=$'\t' read -r http dns tcp tls ttfb total bytes <<< "$metrics"
-
-            if [[ $http == 200 && $rc -eq 0 && $bytes -gt 0 ]]; then
+            if [[ ${http:-000} == 200 && $rc -eq 0 && ${bytes:-0} -gt 0 ]]; then
                 printf '%s\n' "$ttfb" >> "$T/$which-ttfb"
                 printf '%s\n' "$total" >> "$T/$which-total"
+            else
+                printf 'HTTP=%s curl_exit=%s\n' "${http:-000}" "$rc" >> "$T/$which-errors"
             fi
 
             sleep "$REQUEST_DELAY"
         done
     done
 
-    echo
-    echo "Successful HTTP 200 responses:"
-
-    awk -F '\t' -v runs="$RUNS" '
-        $2 == 200 && $9 == 0 && $8 > 0 { count[$1]++ }
-        END {
-            printf "primary:  %d/%d\n", count["primary"], runs
-            printf "fallback: %d/%d\n", count["fallback"], runs
-        }
-    ' "$T/timings"
-
-    echo
-    echo "Median response times (only HTTP 200 responses):"
-
     for which in primary fallback; do
-        ttfb=$(median "$T/$which-ttfb")
-        total=$(median "$T/$which-total")
-
         if [[ $which == primary ]]; then
             url=$PRIMARY
         else
             url=$FALLBACK
         fi
 
-        printf '%-9s TTFB: %-12s TOTAL: %-12s %s\n' \
-            "$which" "$(ms "$ttfb")" "$(ms "$total")" "$url"
+        n=$(grep -c . "$T/$which-total")
+
+        if [[ $n -eq $RUNS ]]; then
+            ok "$which answered all $RUNS downloads (HTTP 200)"
+        else
+            note "$which answered only $n of $RUNS downloads (HTTP 200)"
+            while read -r count desc; do
+                note "$which: ${count}x $desc"
+            done < <(sort "$T/$which-errors" | uniq -c)
+        fi
+
+        note "$which: median TTFB $(ms "$(median "$T/$which-ttfb")"), median total $(ms "$(median "$T/$which-total")"), fastest total $(ms "$(fastest "$T/$which-total")")  $url"
     done
-
-    echo
-    echo "HTTP / connection errors:"
-
-    awk -F '\t' '
-        $2 != 200 || $9 != 0 {
-            printf "%-9s HTTP=%s curl_exit=%s\n", $1, $2, $9
-        }
-    ' "$T/timings"
 
     mp=$(median "$T/primary-total")
     mf=$(median "$T/fallback-total")
 
-    echo
     if [[ $mp == n/a || $mf == n/a ]]; then
-        note "not enough successful HTTP 200 responses to compare both APIs"
+        note "not enough successful responses to compare the two APIs"
     elif awk -v p="$mp" -v f="$mf" 'BEGIN { exit !(p <= f) }'; then
         delta=$(awk -v p="$mp" -v f="$mf" 'BEGIN { printf "%.1f", (f - p) * 1000 }')
-        note "primary is faster by median TOTAL: ${delta} ms"
+        note "primary is faster by median total time: ${delta} ms"
     else
         delta=$(awk -v p="$mp" -v f="$mf" 'BEGIN { printf "%.1f", (p - f) * 1000 }')
-        note "primary is slower by median TOTAL: ${delta} ms"
+        note "primary is slower by median total time: ${delta} ms"
     fi
 
-    note "each measurement uses a new curl process and a fresh connection"
-    note "HTTP errors are reported separately and excluded from timing medians"
+    note "each download uses a new curl process and a fresh connection; timings never fail the test"
 fi
 
 echo

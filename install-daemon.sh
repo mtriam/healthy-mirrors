@@ -75,7 +75,7 @@ if [[ $ACTION == configure ]]; then
     declare -A CFG_DEF=(
         [DENY_ON]=partial
         [COOLDOWN]=60
-        [HM_TIMEOUT]=30
+        [HM_TIMEOUT]=45
         [HELPERS_RE]='yay|paru|pikaur|trizen|octopi'
         [SHELLY_RE]='shelly.*'
         [WATCH]=/etc/pacman.conf
@@ -160,7 +160,7 @@ EOF
         case $1 in
             DENY_ON)                      echo "off | failure | partial" ;;
             COOLDOWN|RECHECK|STOP_GRACE)  echo "a number >= 0 (seconds), e.g. 60" ;;
-            HM_TIMEOUT)                   echo "a number > 0 (seconds), e.g. 30" ;;
+            HM_TIMEOUT)                   echo "a number > 0 (seconds), e.g. 45" ;;
             MAX_HELD)                     echo "an integer >= 1" ;;
             HELPERS_RE|SHELLY_RE)         echo "a regular expression, e.g. yay|paru" ;;
             WATCH)                        echo "absolute paths separated by \":\", no spaces" ;;

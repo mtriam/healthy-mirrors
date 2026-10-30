@@ -349,6 +349,20 @@ denied && ok "without DENY_ON a partial result is denied" || bad "default does n
 grep -q 'DENY_ON=partial:' "$LOG" && ok "startup log names the active mode" || bad "startup log does not name DENY_ON"
 stop_daemon
 
+echo "== 23. a stop that also terminates hm (systemd signals the whole service) never denies"
+start_daemon SLOW=20 STOP_GRACE=5 DENY_ON=partial
+( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
+sleep 1
+pkill -TERM -f '^sleep 20$'                    # hm first: the hardest order for the daemon
+kill -TERM "$DPID"
+wait "$PP" 2>/dev/null
+wait "$DPID" 2>/dev/null; DPID=
+grep -q '^\[options\]' "$T/out.pac" && ok "request is allowed although hm was terminated during the stop" \
+                                     || bad "request was denied during a stop that terminated hm"
+grep -qF '<4>hm was terminated (exit code -15)' "$LOG" && ok "termination logged as a warning, not as a failure" \
+                                                       || bad "termination not logged as expected"
+pkill -f '^sleep 20$' 2>/dev/null
+
 echo
 echo "passed: $PASS, failed: $FAIL"
 [[ $FAIL -eq 0 ]]

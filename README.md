@@ -44,6 +44,8 @@ hm: warning: CachyOS API https://cachyos.org/archlinuxmirrorlist/api/cachyos-mir
 
 If both addresses fail, `hm` stops with an error that names both reasons and changes nothing. The Arch Linux API has no fallback.
 
+Every download is limited to 10 seconds, so on a very slow network one `hm` run can take up to about 30 seconds (primary, fallback and Arch Linux API). The default `HM_TIMEOUT` of `hm-daemon` (45 s) stays above that.
+
 ### Health rules
 
 For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
@@ -143,9 +145,9 @@ git pull --ff-only
 
 - `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755` and can be run repeatedly.
 - `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
-- Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
+- Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists. This also holds when `hm` itself is terminated by the same stop.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `--configure`, are kept.
-- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default (`DENY_ON=partial`): a failed check, or a list that had to be skipped, stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. To get the previous behavior run `./install-daemon.sh --configure` and choose `off` (or `failure` to block only when the check failed as a whole). (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this.
+- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default (`DENY_ON=partial`): a failed check, or a list that had to be skipped, stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. To get the previous behavior run `./install-daemon.sh --configure` and choose `off` (or `failure` to block only when the check failed as a whole). (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this. (4) The default `HM_TIMEOUT` is now `45` seconds (was `30`), because one `hm` run can take up to about 30 seconds on a very slow network. A value set with `--configure` or a drop-in is kept. (5) A stop of the service never blocks a held program, also when `hm` is terminated by the same stop (it is logged as `hm was terminated`).
 
 ## Uninstall
 
@@ -260,11 +262,12 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - The daemon logs the outcome by `hm`'s exit status:
   - `0`: `hm finished OK`,
   - `2` (some lists skipped, the others updated): `hm skipped some mirror lists (exit code 2)` at warning priority. This is not logged as a failure,
+  - `-15` or `143` (`hm` was terminated by `SIGTERM`, typically because the service is being stopped): `hm was terminated (exit code N)` at warning priority; nothing is blocked because of it,
   - anything else: `hm FAILED (exit code N)` or `hm timed out` at error priority.
 - A run in which `hm` used the fallback CachyOS API ends with exit status `0` and is logged as `hm finished OK`; the warning that names the reason is part of the `hm` output that the daemon writes to the journal before it.
-- On timeout (default 30 s) `hm` is killed together with its child processes. Children are found through their parent links, also when they moved to another session or process group; a process that detaches completely from `hm`'s process tree (double fork) is not tracked, which `hm` never does.
+- On timeout (default 45 s) `hm` is killed together with its child processes. Children are found through their parent links, also when they moved to another session or process group; a process that detaches completely from `hm`'s process tree (double fork) is not tracked, which `hm` never does.
 - If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check (and not at all with `RECHECK=0`).
-- On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests (never denies them) and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway.
+- On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests (never denies them, not even when `hm` is terminated at the same moment: systemd sends `SIGTERM` to the whole service, `hm` included) and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway.
 - At most `MAX_HELD` requests are held while `hm` runs; further ones are let through, so a flood of local processes cannot exhaust the daemon's file descriptors. This trades strict enforcement for availability: requests beyond the limit may proceed with the previous mirror lists.
 - Invalid configuration (see the table below) stops the daemon at startup with a message that names the variable. Unrecoverable `fanotify`/`inotify` errors do the same at runtime.
 - Exit status: `0` after a requested stop, `1` for invalid configuration or an infrastructure error, `2` for an unexpected internal error (the traceback is in the journal). Before exiting after an error the daemon answers the requests it still holds; whatever is left, the kernel allows when the daemon's `fanotify` descriptor is closed, so `pacman` cannot hang because the daemon died. systemd restarts the service.
@@ -304,7 +307,7 @@ What "blocked" means: the daemon answers the waiting `open()` of `/etc/pacman.co
 
 **What is never blocked.**
 
-- Stopping or restarting the daemon (`SIGTERM`, the end of `STOP_GRACE`) releases everything. A stop is not a failure of `hm`.
+- Stopping or restarting the daemon (`SIGTERM`, the end of `STOP_GRACE`) releases everything. A stop is not a failure of `hm`. This includes the case that `hm` is terminated by the same stop (exit code `-15` or `143`, logged as `hm was terminated`).
 - Requests beyond `MAX_HELD` are let through (availability over strictness).
 - If the daemon dies, the kernel allows all outstanding requests.
 - Programs that are not recognized as clients, and the operations that do not trigger `hm` (`pacman -Q`, ...).
@@ -344,7 +347,7 @@ Environment="HELPERS_RE=yay|paru"
 | Variable | Default | Meaning |
 |---|---|---|
 | `HM` | `/usr/local/bin/hm` | Script to run (absolute path) |
-| `HM_TIMEOUT` | `30` | Seconds before `hm` is killed (> 0) |
+| `HM_TIMEOUT` | `45` | Seconds before `hm` is killed (> 0). One run can take up to 30 s on a very slow network (three downloads, each limited to 10 s), so keep it above that |
 | `COOLDOWN` | `60` | Minimum seconds between `hm` runs (≥ 0). In blocking mode also the window in which a blocked program can be started again |
 | `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated, at least one) |
 | `SHELLY_RE` | `shelly.*` | Process names that always trigger `hm` (regular expression) |
@@ -396,12 +399,12 @@ To follow the daemon logs in real time:
 journalctl -fu hm-daemon.service
 ```
 
-Each `open()` is logged with the process name and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`). The command line is logged only for `pacman`, AUR helpers and `shelly`; any other process that opens the file is logged by name only and its command line is not even read. A triggering open is followed by `started`, the `hm` output, `hm finished OK`, `hm skipped some mirror lists (exit code 2)` or `hm FAILED (exit code N)`, and `releasing ... (hm exited with code N)`. In blocking mode a line `denying X of Y held open() calls ...` follows when requests were denied.
+Each `open()` is logged with the process name and whether it triggered `hm` (`trigger=True/False`, `cooldown=True/False`). The command line is logged only for `pacman`, AUR helpers and `shelly`; any other process that opens the file is logged by name only and its command line is not even read. A triggering open is followed by `started`, the `hm` output, `hm finished OK`, `hm skipped some mirror lists (exit code 2)`, `hm was terminated (exit code N)` or `hm FAILED (exit code N)`, and `releasing ... (hm exited with code N)`. In blocking mode a line `denying X of Y held open() calls ...` follows when requests were denied.
 
 Warnings and errors carry a journal priority, so problems can be listed directly:
 
 ```bash
-journalctl -u hm-daemon.service -p warning   # hm failures, skipped lists, denials, timeouts, hold limit, configuration and infrastructure errors
+journalctl -u hm-daemon.service -p warning   # hm failures, skipped lists, terminations, denials, timeouts, hold limit, configuration and infrastructure errors
 ```
 
 To see whether `hm` has recently had to use the fallback CachyOS API, search the `hm` output in the journal:
@@ -456,8 +459,9 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 20 | `hm` receives `HM_DENY_ON` and `HM_DENY_RETRY` in deny mode, and neither otherwise (also not inherited from the daemon's environment) |
 | 21 | `DENY_ON` together with `COOLDOWN=0` produces a warning at startup |
 | 22 | The default is `DENY_ON=partial`: without the variable a partial result is denied and the startup log names the mode |
+| 23 | A stop that also terminates `hm` (as systemd does for the whole service) never denies: the held request is allowed and `hm was terminated` is logged as a warning |
 
-A successful run ends with `passed: 52, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16 and 19. If a single case fails on a heavily loaded system, run the script again before investigating.
+A successful run ends with `passed: 54, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16, 19 and 23. If a single case fails on a heavily loaded system, run the script again before investigating.
 
 ### API fallback and API comparison (`test-hm-api.sh`)
 
@@ -480,11 +484,11 @@ Part 1 replaces `curl` with a stub that serves canned data; part 2 downloads the
 | 5 | Both APIs unusable: exit status 1, both addresses named, no claim that a fallback is used |
 | 6 | The Arch Linux API has no fallback: its failure is an error |
 | 7 | (live) The two real APIs give the same result: the same known mirrors and the same healthy mirrors per architecture (`x86_64`, `x86_64_v3`, `x86_64_v4`), and `hm` decides the same for the mirrorlists of this system. Skipped with `--offline` or without network |
-| 8 | (live) Response time: each real API is downloaded 5 times (after a warm-up round, alternating which goes first) and the medians are compared. Information only. Skipped with `--offline` or without network |
+| 8 | (live) Response time: each real API is downloaded 20 times (after a warm-up request, alternating which goes first). It passes if every download got HTTP 200; the median and fastest times are printed as notes. Skipped with `--offline` or without network |
 
 Test 7 prints a `NOTE` line on whether the two responses are also identical byte for byte after key normalization (`jq -S`); a difference in fields that `hm` does not use is not a failure. The two real APIs are downloaded seconds apart, so if test 7 fails, run it again before investigating. The jq filters in the test's `derive` function copy those in `hm`; if you change the health rules in `hm`, change them there as well.
 
-Test 8 prints the median and the fastest time of each address, and a line saying whether the primary API is not slower than the fallback. If it is slower, the test only prints a note and does not fail: timings depend on the network and on the moment, so run it again, and from different networks, before you change the order of the two addresses (`RUNS` at the top of the script sets the number of downloads).
+Test 8 prints, for each address, the median time to first byte, the median total time and the fastest total time, and a line saying which API was faster by the median total time. Timings never fail the test: they depend on the network and on the moment, so run it again, and from different networks, before you change the order of the two addresses (`RUNS` at the top of the script sets the number of downloads, `REQUEST_DELAY` the pause between them).
 
 A successful run ends with `passed: N, failed: 0` and exit status 0 (`skipped` counts the live part when it did not run).
 

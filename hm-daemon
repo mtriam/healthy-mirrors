@@ -17,6 +17,9 @@ held program is then allowed to continue when hm is done, whatever the result. O
 happen to be held are always allowed. A program started again within the cooldown is
 let through (no new hm run, no denial).
 
+A stop of the service never denies: held requests are allowed, also when hm itself is
+terminated by the SIGTERM that systemd sends to the whole service (hm is in the same cgroup).
+
 Exit status: 0 after a requested stop, 1 for invalid configuration or an
 infrastructure error, 2 for an unexpected internal error (the traceback is logged).
 Whatever the reason, the kernel allows all outstanding permission requests when the
@@ -43,6 +46,9 @@ DENY_LEVELS = {"off": 0, "failure": 1, "partial": 2}
 
 # exit codes of hm (see hm --help)
 HM_PARTIAL = 2
+# hm was terminated by SIGTERM: killed by the signal (-15) or hm's own exit after a deferred
+# termination (143). systemd sends SIGTERM to the whole service when it is stopped, hm included.
+HM_TERMINATED = (-signal.SIGTERM, 128 + signal.SIGTERM)
 
 FAN_CLOEXEC, FAN_CLASS_CONTENT = 0x1, 0x4
 FAN_OPEN_PERM, FAN_MARK_ADD, FAN_ALLOW, FAN_DENY = 0x10000, 0x1, 1, 2
@@ -131,7 +137,9 @@ def load_config():
     HM = os.environ.get("HM", "/usr/local/bin/hm")
     if not os.path.isabs(HM):
         raise Fatal(f"invalid HM={HM!r}: must be an absolute path")
-    HM_TIMEOUT = env_float("HM_TIMEOUT", "30", 0, exclusive=True)   # seconds before hm is killed
+    # seconds before hm is killed; the worst case of one hm run is three downloads of 10 s each
+    # (two CachyOS addresses and the Arch Linux API), so the default stays well above 30 s
+    HM_TIMEOUT = env_float("HM_TIMEOUT", "45", 0, exclusive=True)
     COOLDOWN = env_float("COOLDOWN", "60", 0)                      # min. seconds between hm runs
     RECHECK = env_float("RECHECK", "600", 0)                       # safety-net check interval, 0 = off
     MAX_HELD = env_int("MAX_HELD", "256", 1)                       # max. open() calls held while hm runs
@@ -593,9 +601,16 @@ def run():
             if hm:
                 rc = hm.poll()
                 if rc is not None:
-                    deny = deny_for(rc)
+                    # A stop of the service is not a failure of the check: systemd sends SIGTERM to
+                    # the whole service, hm included, and the daemon may see hm end before it has
+                    # seen its own signal. Never deny because of that.
+                    terminated = rc in HM_TERMINATED
+                    deny = deny_for(rc) and not terminated and not STOP
                     if rc == 0:
                         log("hm finished OK")
+                    elif terminated:
+                        log(f"hm was terminated (exit code {rc}); held programs continue "
+                            f"with the existing mirror lists", WARN)
                     elif rc == HM_PARTIAL:
                         log(f"hm skipped some mirror lists (exit code {rc}); "
                             + ("blocking the programs that triggered it"
