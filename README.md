@@ -26,6 +26,26 @@ See [Usage](#usage) for manual operation, [hm-daemon](#hm-daemon) for details an
 
 The `hm` script reads existing mirror-list files included via `/etc/pacman.conf` (including ordinary shell-glob patterns) and checks the current CachyOS and Arch Linux mirror status using their respective APIs. Non-absolute or missing `Include` entries are skipped; if no existing mirror-list file is found, the script fails. A mirror-list file that is a symlink is an error (see [Limitations](#limitations)).
 
+### Data sources and the CachyOS fallback
+
+| Data | Address |
+|---|---|
+| CachyOS (primary) | `https://cachyos.org/archlinuxmirrorlist/api/cachyos-mirrors` |
+| CachyOS (fallback) | `https://dashboard.cachyos.org/api/v1/mirrors` |
+| Arch Linux | `https://archlinux.org/mirrors/status/json/` |
+
+`hm` reads the CachyOS mirror status from the primary address, the one `rate-mirrors cachyos` uses by default, which was chosen for its response time (`test-hm-api.sh` measures both addresses). It switches to the fallback, the CachyOS dashboard API, only if the primary one cannot be used: the download fails, the response is not valid mirror data, or more than half of its entries are malformed. Both addresses are expected to serve the same data; the format is the same and the content was identical when compared (see [`test-hm-api.sh`](#api-fallback-and-api-comparison-test-hm-apish)).
+
+When the fallback is used, `hm` says so on stderr, with the reason, and carries on with the data it got. This is not an error: the exit status is not changed, no desktop notification is sent, and `hm-daemon` does not block anything because of it.
+
+```text
+hm: warning: CachyOS API https://cachyos.org/archlinuxmirrorlist/api/cachyos-mirrors is not usable (download failed: curl: (22) The requested URL returned error: 503); using the fallback https://dashboard.cachyos.org/api/v1/mirrors
+```
+
+If both addresses fail, `hm` stops with an error that names both reasons and changes nothing. The Arch Linux API has no fallback.
+
+### Health rules
+
 For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
 
 For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour.
@@ -43,7 +63,7 @@ WARNING: left unchanged: cachyos-v4: none of the mirrors listed by the API is he
 
 A skipped list is shown with the state it currently has (marked `skipped`). The exit status tells the outcome apart (see [Exit status](#exit-status)): if only some lists are skipped, `hm` exits with status `2`; if no list could be updated, with status `1`.
 
-API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. Entries of an API response that cannot be used are skipped with a warning (`ignored N of M malformed entries`); a response in which more than half of the entries are malformed is refused.
+API responses and mirror URLs are validated, and API data is never interpreted as `sed` or regex syntax. Entries of an API response that cannot be used are skipped with a warning (`ignored N of M malformed entries`); a response in which more than half of the entries are malformed is refused (for CachyOS this is one of the reasons to switch to the fallback).
 
 Updates are transactional: every changed file is first staged and backed up next to the original (`.hm-stage.*`, `.hm-backup.*` in the mirrorlist directory), checked against an invariant (the only difference may be the `#UH#` marker in front of `Server = ` lines), and then replaced with `mv`. If any step fails, files already replaced are restored from their backups, so a failed run leaves the mirrorlists as they were. `SIGTERM`, `SIGINT` and `SIGHUP` received during an update are deferred until it has finished. Each individual file is replaced atomically, but a set of files cannot be replaced as one atomic operation (see [Limitations](#limitations)). If `hm` is killed with `SIGKILL` in the middle of an update (for example by the daemon timeout), leftover `.hm-stage.*` / `.hm-backup.*` files may remain. `hm` removes `.hm-stage.*` files older than one day (as root on every run, as a regular user whenever it writes anyway); `.hm-backup.*` files are never removed automatically, because after a failed rollback a backup may be the only intact copy. A successfully restored file consumes its backup, so only backups of files that could not be restored are kept, and they are reported.
 
@@ -53,8 +73,8 @@ After processing the mirror lists, it prints a summary showing the number of act
 
 | Status | Meaning |
 |---|---|
-| `0` | All lists were processed: healthy mirrors are active, unhealthy ones are disabled. |
-| `1` | An error occurred, or no list could be updated. Nothing was changed. |
+| `0` | All lists were processed: healthy mirrors are active, unhealthy ones are disabled. This includes a run that used the fallback CachyOS API. |
+| `1` | An error occurred, or no list could be updated. Nothing was changed. This includes both CachyOS APIs being unusable. |
 | `2` | Some lists were skipped (left exactly as they were, possibly out of date), the others were updated. |
 
 Status `2` also applies to `--dry-run`, so that a preview agrees with a real run. A caller that must not continue with lists that are not up to date (the `up` function below, [hm-daemon in blocking mode](#blocking-mode-deny_on)) should treat everything other than `0` as "not safe".
@@ -67,6 +87,7 @@ Status `2` also applies to `--dry-run`, so that a preview agrees with a real run
 - **A set of files is not replaced atomically.** Every file is replaced atomically (and each one is valid on its own), but a program that reads the mirrorlists while `hm` runs may briefly see some lists updated and others not. When `hm` is started by `hm-daemon`, such programs are held until it finishes. After a crash or power loss, every file is either the old or the new version, and leftover `.hm-stage.*` / `.hm-backup.*` files may remain.
 - **No locking between runs.** Two `hm` runs at the same time (for example a manual `hm` while the daemon runs one) are not serialized. The result is one of the valid states, possibly built from two different API snapshots; the next run corrects it.
 - **Unmanaged mirrors are never judged** (see above), and a failed run keeps the lists as they were: they may be out of date, never half-written.
+- **The CachyOS fallback is a second address, not an independent source.** Both addresses are served by CachyOS and may share the same backend, so the fallback protects against one address being down or broken, not against wrong data. The Arch Linux API has no fallback.
 - **Abbreviated long options** of `pacman` (such as `--syn`) are not recognized by `hm-daemon`.
 - **Blocking mode is a guard, not a security boundary.** See [Blocking mode](#blocking-mode-deny_on): it can be bypassed on purpose (retry within the cooldown), and it does not apply to requests beyond `MAX_HELD`, to programs that are not recognized as clients, or while the daemon is not running.
 
@@ -124,7 +145,7 @@ git pull --ff-only
 - `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `--configure`, are kept.
-- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default (`DENY_ON=partial`): a failed check, or a list that had to be skipped, stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. To get the previous behavior run `./install-daemon.sh --configure` and choose `off` (or `failure` to block only when the check failed as a whole).
+- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default (`DENY_ON=partial`): a failed check, or a list that had to be skipped, stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. To get the previous behavior run `./install-daemon.sh --configure` and choose `off` (or `failure` to block only when the check failed as a whole). (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this.
 
 ## Uninstall
 
@@ -240,6 +261,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
   - `0`: `hm finished OK`,
   - `2` (some lists skipped, the others updated): `hm skipped some mirror lists (exit code 2)` at warning priority. This is not logged as a failure,
   - anything else: `hm FAILED (exit code N)` or `hm timed out` at error priority.
+- A run in which `hm` used the fallback CachyOS API ends with exit status `0` and is logged as `hm finished OK`; the warning that names the reason is part of the `hm` output that the daemon writes to the journal before it.
 - On timeout (default 30 s) `hm` is killed together with its child processes. Children are found through their parent links, also when they moved to another session or process group; a process that detaches completely from `hm`'s process tree (double fork) is not tracked, which `hm` never does.
 - If a watched file is replaced (editor, `sed -i`, package update), the daemon re-marks the new file immediately via an inotify watch on its directory. A slow periodic check (`RECHECK`) is kept as a safety net. If a watched path is a symlink, replacement of its target is found only by that periodic check (and not at all with `RECHECK=0`).
 - On stop (`SIGTERM`/`SIGINT`) the daemon starts no new `hm` runs, lets a running `hm` finish for up to `STOP_GRACE` seconds, releases all held requests (never denies them) and exits. `hm` defers `SIGTERM`/`SIGINT`/`SIGHUP` while it replaces mirrorlists, so a stop cannot interrupt an update halfway.
@@ -287,6 +309,7 @@ What "blocked" means: the daemon answers the waiting `open()` of `/etc/pacman.co
 - If the daemon dies, the kernel allows all outstanding requests.
 - Programs that are not recognized as clients, and the operations that do not trigger `hm` (`pacman -Q`, ...).
 - A program that already has `pacman.conf` open or has read the lists before the daemon started: the guard only sees `open()` calls.
+- A run that used the fallback CachyOS API: it still ends with status `0`.
 
 Known limitations of blocking mode:
 
@@ -352,9 +375,13 @@ Blocking mode needs no additional capability or unit change: `FAN_DENY` is an an
 
 Process names are not authenticated: any local process named `pacman` (or matching `SHELLY_RE`/`HELPERS_RE`) that opens `pacman.conf` with a sync operation can trigger `hm`, at most once per `COOLDOWN`. This gives no privileges, because `hm` takes no input from the triggering process, but it can delay other `pacman` runs for the duration of one `hm` run. In blocking mode such a process can additionally make a *failed* run deny other triggering programs that are held at that moment, and a process named like a non-client is never denied. This is a convenience guard, not an access control mechanism.
 
+`hm` takes its API addresses from constants in the script, not from the environment or the command line, so neither a user nor a process that triggers the daemon can point a root run of `hm` at another server.
+
 ## Error notifications
 
-When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads, unparsable or broken API responses, failed `sudo` authentication, symlinked mirrorlists, and lists that were left unchanged (one notification names all of them, see [What it does](#what-it-does)). In a terminal the error is printed as usual and no notification is sent.
+When `hm` is not run in a terminal (for example by `hm-daemon`, or from a keybinding), errors are also shown as desktop notifications: failed downloads (of both CachyOS addresses, or of the Arch Linux API), unparsable or broken API responses, failed `sudo` authentication, symlinked mirrorlists, and lists that were left unchanged (one notification names all of them, see [What it does](#what-it-does)). In a terminal the error is printed as usual and no notification is sent.
+
+Using the fallback CachyOS API is not an error and sends no notification; it is only printed (and so ends up in the journal when `hm` is started by the daemon).
 
 - When run as a regular user, `hm` calls `notify-send` directly.
 - When run as root (by the daemon), `hm` notifies every active user session, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
@@ -377,6 +404,12 @@ Warnings and errors carry a journal priority, so problems can be listed directly
 journalctl -u hm-daemon.service -p warning   # hm failures, skipped lists, denials, timeouts, hold limit, configuration and infrastructure errors
 ```
 
+To see whether `hm` has recently had to use the fallback CachyOS API, search the `hm` output in the journal:
+
+```bash
+journalctl -u hm-daemon.service | grep 'using the fallback'
+```
+
 To see exactly what the service is allowed to do:
 
 ```bash
@@ -385,6 +418,10 @@ systemd-analyze security hm-daemon.service
 ```
 
 ## Tests
+
+There are two test scripts. Neither writes to `/etc` or needs the daemon to be installed.
+
+### hm-daemon (`test-hm-daemon.sh`)
 
 `test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client. Test 9 imports `hm-daemon` as a module (nothing is started) to check how command lines are classified.
 
@@ -422,7 +459,38 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 
 A successful run ends with `passed: 52, failed: 0` and exit status 0. Tests 1, 2 and 6 depend on timing (for example, in test 1 the new inode has to be re-marked before the fake client opens the file; a 0.2 s margin is used), as do tests 16 and 19. If a single case fails on a heavily loaded system, run the script again before investigating.
 
-The script does **not** cover `hm` itself (mirror evaluation, transactional updates, exit status `0`/`1`/`2`), desktop notifications, the systemd sandbox or the installers (including `--configure`). Check those with:
+### API fallback and API comparison (`test-hm-api.sh`)
+
+`test-hm-api.sh` tests the CachyOS API fallback of `hm`, checks that the two CachyOS APIs give the same result and measures which of them answers faster. It needs no root: `hm` is only run with `--dry-run` (nothing is written, no `sudo`). It does read the real `/etc/pacman.conf` and the mirrorlists it includes, so it also needs a working setup (`hm --list` must succeed). The API addresses are read from the `hm` file itself, so the test cannot drift from it.
+
+```bash
+./test-hm-api.sh                  # uses ./hm; part 2 downloads the real APIs once
+./test-hm-api.sh --offline        # part 1 only, no network needed
+./test-hm-api.sh /path/to/hm
+```
+
+Part 1 replaces `curl` with a stub that serves canned data; part 2 downloads the real data once and feeds the same snapshots to `hm`, so the comparison is not disturbed by the data changing between two downloads; part 3 times the real addresses.
+
+| # | What is checked |
+|---|---|
+| 1 | The primary API works: the fallback is not requested and not mentioned |
+| 2 | The primary download fails: the fallback is used; the message names both addresses and the reason; the result is identical to the one with the primary API |
+| 3 | The primary answers with something that is not mirror data: fallback used, reason named, same result |
+| 4 | The primary has more than half of its entries malformed: fallback used, reason named, same result |
+| 5 | Both APIs unusable: exit status 1, both addresses named, no claim that a fallback is used |
+| 6 | The Arch Linux API has no fallback: its failure is an error |
+| 7 | (live) The two real APIs give the same result: the same known mirrors and the same healthy mirrors per architecture (`x86_64`, `x86_64_v3`, `x86_64_v4`), and `hm` decides the same for the mirrorlists of this system. Skipped with `--offline` or without network |
+| 8 | (live) Response time: each real API is downloaded 5 times (after a warm-up round, alternating which goes first) and the medians are compared. Information only. Skipped with `--offline` or without network |
+
+Test 7 prints a `NOTE` line on whether the two responses are also identical byte for byte after key normalization (`jq -S`); a difference in fields that `hm` does not use is not a failure. The two real APIs are downloaded seconds apart, so if test 7 fails, run it again before investigating. The jq filters in the test's `derive` function copy those in `hm`; if you change the health rules in `hm`, change them there as well.
+
+Test 8 prints the median and the fastest time of each address, and a line saying whether the primary API is not slower than the fallback. If it is slower, the test only prints a note and does not fail: timings depend on the network and on the moment, so run it again, and from different networks, before you change the order of the two addresses (`RUNS` at the top of the script sets the number of downloads).
+
+A successful run ends with `passed: N, failed: 0` and exit status 0 (`skipped` counts the live part when it did not run).
+
+### What the tests do not cover
+
+Neither script covers mirror evaluation and transactional updates of `hm` with real writes, desktop notifications, the systemd sandbox or the installers (including `--configure`). Check those with:
 
 ```bash
 hm --dry-run; echo "exit=$?"     # what a run would change, nothing is written; 0, 1 or 2
@@ -453,6 +521,7 @@ rm -f /tmp/hm-daemon-broken
 | `install.sh` | Installs `hm` to `/usr/local/bin` |
 | `install-daemon.sh` | Installs, updates (with rollback), configures interactively (`--configure`) or removes (`--remove`) the hardened `hm-daemon.service` |
 | `test-hm-daemon.sh` | Tests for the daemon |
+| `test-hm-api.sh` | Tests for the CachyOS API fallback of `hm` and a comparison of the two CachyOS APIs |
 | `docs/` | Images used in this README |
 
 ## License

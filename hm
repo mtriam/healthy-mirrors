@@ -51,7 +51,12 @@ if (( LIST + NOTIFY_TEST > 1 )) || { (( LIST + NOTIFY_TEST == 1 )) && (( CLEAN +
     exit 1
 fi
 
-CACHYOS_API='https://dashboard.cachyos.org/api/v1/mirrors'
+# CachyOS mirror status: the first address (the one "rate-mirrors cachyos" uses by default) is
+# used first, chosen for its response time; the dashboard API is only a fallback for when the
+# first one cannot be used. Both are expected to serve the same data, and test-hm-api.sh
+# compares both their results and their speed.
+CACHYOS_API='https://cachyos.org/archlinuxmirrorlist/api/cachyos-mirrors'
+CACHYOS_API_FALLBACK='https://dashboard.cachyos.org/api/v1/mirrors'
 ARCH_API='https://archlinux.org/mirrors/status/json/'
 MARK='#UH#'
 STALE_MINUTES=1440      # staging files older than this are leftovers of a killed update
@@ -647,43 +652,85 @@ KNOWN_CACHYOS=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
 KNOWN_ARCH=$NEW_TEMP_PATH
 
+# Reason why the last API response could not be used (set by check_entries and
+# fetch_cachyos_api, which do not exit on their own so that the caller can decide).
+FETCH_ERROR=''
+
 # $1 = API name, $2 = "total usable" entry counts
+# Returns 0 if the response is usable (a few malformed entries only produce a warning);
+# returns 1 and sets FETCH_ERROR if it is not.
 check_entries() {
     local api="$1" total usable malformed
 
     read -r total usable <<<"$2"
-    [[ "$total" =~ ^[0-9]+$ && "$usable" =~ ^[0-9]+$ ]] ||
-        die "cannot count the entries of the $api API response"
+    [[ "$total" =~ ^[0-9]+$ && "$usable" =~ ^[0-9]+$ ]] || {
+        FETCH_ERROR="cannot count the entries of the $api API response"
+        return 1
+    }
 
     malformed=$((total - usable))
 
     if (( malformed * 2 > total )); then
-        die "the $api API response looks broken: $malformed of $total entries are malformed"
+        FETCH_ERROR="the $api API response looks broken: $malformed of $total entries are malformed"
+        return 1
     fi
     if (( malformed > 0 )); then
         printf 'hm: warning: ignored %d of %d malformed entries in the %s API response\n' \
             "$malformed" "$total" "$api" >&2
     fi
+
+    return 0
 }
 
-curl --connect-timeout 5 --max-time 10 -fsSL "$CACHYOS_API" -o "$JSON_CACHYOS" ||
-    die 'cannot download CachyOS mirror status'
+# Download one CachyOS mirror status API ($1 = URL) into the file $2 and check that the
+# response is usable. Returns 0 if it is; returns 1 and sets FETCH_ERROR if it is not.
+fetch_cachyos_api() {
+    local url="$1" file="$2" out counts
 
-jq -e '
-    (.mirrors | type == "array")
-    and ([ .mirrors[]
-           | select((.url | type == "string") and (.checks | type == "array"))
-         ] | length) > 0
-' "$JSON_CACHYOS" >/dev/null ||
-    die 'invalid or incomplete CachyOS API response'
+    FETCH_ERROR=''
 
-counts=$(jq -r '
-    [ (.mirrors | length),
-      ([ .mirrors[]
-         | select((.url | type == "string") and (.checks | type == "array"))
-       ] | length) ] | @tsv
-' "$JSON_CACHYOS") || die 'cannot count the entries of the CachyOS API response'
-check_entries CachyOS "$counts"
+    if ! out=$(curl --connect-timeout 5 --max-time 10 -fsSL "$url" -o "$file" 2>&1); then
+        out=${out//$'\n'/ }
+        FETCH_ERROR="download failed${out:+: $out}"
+        return 1
+    fi
+
+    if ! jq -e '
+        (.mirrors | type == "array")
+        and ([ .mirrors[]
+               | select((.url | type == "string") and (.checks | type == "array"))
+             ] | length) > 0
+    ' "$file" >/dev/null 2>&1; then
+        FETCH_ERROR='invalid or incomplete response'
+        return 1
+    fi
+
+    if ! counts=$(jq -r '
+        [ (.mirrors | length),
+          ([ .mirrors[]
+             | select((.url | type == "string") and (.checks | type == "array"))
+           ] | length) ] | @tsv
+    ' "$file" 2>/dev/null); then
+        FETCH_ERROR='cannot count the entries of the CachyOS API response'
+        return 1
+    fi
+
+    check_entries CachyOS "$counts"
+}
+
+# CachyOS: the primary API first, the fallback only if the primary cannot be used (download
+# failed, not valid mirror data, or more than half of its entries unusable). Both failing is
+# an error. Using the fallback is not: it is reported on stderr (hm-daemon logs it to the
+# journal) and the run continues with the same data.
+if ! fetch_cachyos_api "$CACHYOS_API" "$JSON_CACHYOS"; then
+    primary_error=$FETCH_ERROR
+
+    fetch_cachyos_api "$CACHYOS_API_FALLBACK" "$JSON_CACHYOS" ||
+        die "cannot get CachyOS mirror status: $CACHYOS_API: $primary_error; $CACHYOS_API_FALLBACK: $FETCH_ERROR"
+
+    printf 'hm: warning: CachyOS API %s is not usable (%s); using the fallback %s\n' \
+        "$CACHYOS_API" "$primary_error" "$CACHYOS_API_FALLBACK" >&2
+fi
 
 curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" ||
     die 'cannot download Arch Linux mirror status'
@@ -702,7 +749,7 @@ counts=$(jq -r '
          | select((.url | type == "string") and (.protocol | type == "string"))
        ] | length) ] | @tsv
 ' "$JSON_ARCH") || die 'cannot count the entries of the Arch Linux API response'
-check_entries 'Arch Linux' "$counts"
+check_entries 'Arch Linux' "$counts" || die "$FETCH_ERROR"
 
 # Validate URLs without treating data as sed/regex syntax.
 validate_urls() {
