@@ -274,13 +274,13 @@ has "$ERR" 'using the fallback' && has "$ERR" 'looks broken' \
     && ok "same result as with primary API" \
     || bad "result differs"
 
-echo "== 5. both APIs unusable: error, exit 1"
+echo "== 5. both APIs unusable: error, exit 3 (mirror status unavailable)"
 
 run_hm fail bad
 
-[[ $RC -eq 1 ]] \
-    && ok "exit status 1" \
-    || bad "exit status $RC (expected 1)"
+[[ $RC -eq 3 ]] \
+    && ok "exit status 3 (mirror status unavailable)" \
+    || bad "exit status $RC (expected 3)"
 
 has "$ERR" 'cannot get CachyOS mirror status' &&
     has "$ERR" "$PRIMARY" &&
@@ -292,12 +292,12 @@ has "$ERR" 'using the fallback' \
     && bad "claims to use the fallback" \
     || ok "does not claim to use the fallback"
 
-echo "== 6. Arch Linux API has no fallback"
+echo "== 6. Arch Linux API has no fallback (failure is exit 3)"
 
 run_hm "$T/cachyos.json" fail fail
 
-[[ $RC -eq 1 ]] && has "$ERR" 'cannot download Arch Linux mirror status' \
-    && ok "exit 1 with the Arch error" \
+[[ $RC -eq 3 ]] && has "$ERR" 'cannot download Arch Linux mirror status' \
+    && ok "exit 3 with the Arch error" \
     || bad "exit $RC: $ERR"
 
 # ---------------------------------------------------------------------------

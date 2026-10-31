@@ -73,7 +73,7 @@ if [[ $ACTION == configure ]]; then
 
     CFG_ORDER=(DENY_ON COOLDOWN HM_TIMEOUT HELPERS_RE SHELLY_RE WATCH MAX_HELD STOP_GRACE RECHECK)
     declare -A CFG_DEF=(
-        [DENY_ON]=partial
+        [DENY_ON]=mirrors-partial
         [COOLDOWN]=60
         [HM_TIMEOUT]=45
         [HELPERS_RE]='yay|paru|pikaur|trizen|octopi'
@@ -92,6 +92,8 @@ if [[ $ACTION == configure ]]; then
   What happens to pacman / yay / shelly when the mirror check does not succeed.
   A blocked program fails at startup with "Operation not permitted". Starting it
   again within COOLDOWN seconds lets it through with the existing mirror lists.
+  An unavailable mirror status (API down) only blocks in the strict modes failure
+  and partial; the mirrors modes only warn in that case.
 EOF
             ;;
             COOLDOWN) cat <<'EOF'
@@ -158,7 +160,7 @@ EOF
 
     cfg_allowed() {
         case $1 in
-            DENY_ON)                      echo "off | failure | partial" ;;
+            DENY_ON)                      echo "off | mirrors | mirrors-partial | failure | partial" ;;
             COOLDOWN|RECHECK|STOP_GRACE)  echo "a number >= 0 (seconds), e.g. 60" ;;
             HM_TIMEOUT)                   echo "a number > 0 (seconds), e.g. 45" ;;
             MAX_HELD)                     echo "an integer >= 1" ;;
@@ -227,7 +229,10 @@ EOF
         fi
         case $name in
             DENY_ON)
-                case $v in off|failure|partial) ;; *) echo "must be one of: off, failure, partial"; return 1 ;; esac ;;
+                case $v in
+                    off|mirrors|mirrors-partial|failure|partial) ;;
+                    *) echo "must be one of: off, mirrors, mirrors-partial, failure, partial"; return 1 ;;
+                esac ;;
             COOLDOWN|RECHECK|STOP_GRACE)
                 [[ $v =~ ^[0-9]+([.][0-9]+)?$ ]] || { echo "must be a number >= 0 (for example 60 or 0.5)"; return 1; } ;;
             HM_TIMEOUT)
@@ -285,8 +290,10 @@ EOF
             echo
             tbl $'Value\tEffect when the check does not succeed' \
                 $'@g:off\tnever block: programs always continue, even with outdated lists' \
-                $'@y:failure\tblock when the check as a whole failed (no list updated, API down, timeout)' \
-                $'@r:partial\tstrict: also block when some list was skipped (left as it was)'
+                $'@g:mirrors\tblock only when the API works but no list has a healthy mirror (API outage: warning only)' \
+                $'@g:mirrors-partial\t(default) like mirrors, and also block when some list was skipped' \
+                $'@y:failure\tblock when the check failed for any reason, including an API outage or a timeout' \
+                $'@r:partial\tstrictest: like failure, and also block when some list was skipped'
         else
             printf '  %sAllowed:%s %s\n' "$C" "$N" "$(cfg_allowed "$name")"
         fi

@@ -239,21 +239,25 @@ grep -q 'trigger=True cooldown=True' "$LOG" && ok "second request logged as cool
                                             || bad "cooldown not logged for the second request"
 stop_daemon
 
-echo "== 12. hm fails: the request is released and the failure is logged at error priority"
-printf '#!/bin/sh\nexit 3\n' > "$T/fail-hm"
+# hm stubs: exit 1 = error / no healthy mirror, exit 2 = some lists skipped,
+# exit 3 = mirror status unavailable (API down)
+printf '#!/bin/sh\nexit 1\n' > "$T/fail-hm"
 chmod +x "$T/fail-hm"
+
+echo "== 12. hm fails: the request is released and the failure is logged at error priority"
 start_daemon HM="$T/fail-hm"
 timeout 5 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
 [[ $? -ne 124 ]] && ok "request was released after a failed hm" || bad "request stayed blocked"
-grep -qF '<3>hm FAILED (exit code 3)' "$LOG" && ok "failure logged with error priority" \
+grep -qF '<3>hm FAILED (exit code 1)' "$LOG" && ok "failure logged with error priority" \
                                               || bad "failure not logged as expected"
 stop_daemon
 
-# hm stubs for the DENY_ON tests
+# more hm stubs
 printf '#!/bin/sh\nexit 2\n' > "$T/partial-hm"                 # some lists skipped
-printf '#!/bin/sh\nsleep 1\nexit 3\n' > "$T/slowfail-hm"        # fails after a second
+printf '#!/bin/sh\nexit 3\n' > "$T/api-hm"                     # mirror status unavailable
+printf '#!/bin/sh\nsleep 1\nexit 1\n' > "$T/slowfail-hm"        # fails after a second
 printf '#!/bin/sh\necho "${HM_DENY_ON-unset} ${HM_DENY_RETRY-unset}" > "$OUT"\n' > "$T/env-hm"
-chmod +x "$T/partial-hm" "$T/slowfail-hm" "$T/env-hm"
+chmod +x "$T/partial-hm" "$T/api-hm" "$T/slowfail-hm" "$T/env-hm"
 
 echo "== 13. hm exits with 2 (some lists skipped), DENY_ON=off: nobody is denied"
 start_daemon HM="$T/partial-hm" DENY_ON=off
@@ -269,7 +273,7 @@ denied && bad "partial result was denied at level failure" || ok "partial result
 stop_daemon
 start_daemon HM="$T/fail-hm" DENY_ON=failure
 denied && ok "failure is denied (EPERM)" || bad "failure was not denied"
-grep -qF '<3>hm FAILED (exit code 3)' "$LOG" && grep -q 'denying 1 of 1 held' "$LOG" \
+grep -qF '<3>hm FAILED (exit code 1)' "$LOG" && grep -q 'denying 1 of 1 held' "$LOG" \
     && ok "failure and denial are logged" || bad "failure or denial not logged"
 stop_daemon
 
@@ -343,10 +347,10 @@ start_daemon DENY_ON=failure
 grep -qF '<4>warning: DENY_ON is set with COOLDOWN=0' "$LOG" && ok "warning logged" || bad "warning missing"
 stop_daemon
 
-echo "== 22. the default is DENY_ON=partial"
+echo "== 22. the default is DENY_ON=mirrors-partial"
 start_daemon HM="$T/partial-hm"
 denied && ok "without DENY_ON a partial result is denied" || bad "default does not deny a partial result"
-grep -q 'DENY_ON=partial:' "$LOG" && ok "startup log names the active mode" || bad "startup log does not name DENY_ON"
+grep -q 'DENY_ON=mirrors-partial:' "$LOG" && ok "startup log names the active mode" || bad "startup log does not name DENY_ON"
 stop_daemon
 
 echo "== 23. a stop that also terminates hm (systemd signals the whole service) never denies"
@@ -362,6 +366,44 @@ grep -q '^\[options\]' "$T/out.pac" && ok "request is allowed although hm was te
 grep -qF '<4>hm was terminated (exit code -15)' "$LOG" && ok "termination logged as a warning, not as a failure" \
                                                        || bad "termination not logged as expected"
 pkill -f '^sleep 20$' 2>/dev/null
+
+echo "== 24. hm exits with 3 (mirror status unavailable): the default mode only warns"
+start_daemon HM="$T/api-hm"
+denied && bad "an API outage was denied in the default mode" || ok "an API outage does not block in the default mode"
+grep -qF '<4>hm could not get the mirror status (exit code 3)' "$LOG" && ! grep -q 'FAILED' "$LOG" \
+    && ok "logged as a warning, not as a failure" || bad "exit 3 not logged as expected"
+stop_daemon
+
+echo "== 25. DENY_ON=mirrors: exit 1 is denied, exit 2 and exit 3 are not"
+start_daemon HM="$T/fail-hm" DENY_ON=mirrors
+denied && ok "no healthy mirror / error (exit 1) is denied" || bad "exit 1 was not denied at level mirrors"
+stop_daemon
+start_daemon HM="$T/partial-hm" DENY_ON=mirrors
+denied && bad "exit 2 was denied at level mirrors" || ok "exit 2 is let through at level mirrors"
+stop_daemon
+start_daemon HM="$T/api-hm" DENY_ON=mirrors
+denied && bad "exit 3 was denied at level mirrors" || ok "exit 3 is let through at level mirrors"
+stop_daemon
+
+echo "== 26. DENY_ON=mirrors-partial denies exit 2; failure and partial also deny exit 3"
+start_daemon HM="$T/partial-hm" DENY_ON=mirrors-partial
+denied && ok "exit 2 is denied at level mirrors-partial" || bad "exit 2 was not denied at level mirrors-partial"
+stop_daemon
+start_daemon HM="$T/api-hm" DENY_ON=failure
+denied && ok "exit 3 is denied at level failure" || bad "exit 3 was not denied at level failure"
+stop_daemon
+start_daemon HM="$T/api-hm" DENY_ON=partial
+denied && ok "exit 3 is denied at level partial" || bad "exit 3 was not denied at level partial"
+stop_daemon
+
+echo "== 27. timeout and a hm that cannot be started do not block in the mirrors modes"
+start_daemon SLOW=20 HM_TIMEOUT=1 DENY_ON=mirrors
+denied && bad "hm timeout was denied at level mirrors" || ok "hm timeout is let through at level mirrors"
+stop_daemon
+start_daemon HM=/nonexistent DENY_ON=mirrors-partial
+denied && bad "an unstartable hm was denied at level mirrors-partial" \
+       || ok "an unstartable hm is let through at level mirrors-partial"
+stop_daemon
 
 echo
 echo "passed: $PASS, failed: $FAIL"

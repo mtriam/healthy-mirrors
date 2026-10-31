@@ -14,13 +14,17 @@ Options:
 
 Exit status:
   0   all mirror lists were processed
-  1   error, or no mirror list could be updated (nothing was changed)
+  1   error, or no mirror list could be updated although the API works
+      (nothing was changed)
   2   some mirror lists were skipped (left unchanged), the others were updated
+  3   the mirror status could not be obtained (API unreachable, unusable or
+      unparsable); nothing was changed
 
 Environment:
   HM_NOTIFY=auto|always|never   desktop notifications on errors
                                 (default: auto = only when not run in a terminal)
-  HM_DENY_ON, HM_DENY_RETRY     set by hm-daemon when its DENY_ON mode is enabled;
+  HM_DENY_ON, HM_DENY_RETRY     set by hm-daemon when its DENY_ON mode is enabled
+                                (failure|partial|mirrors|mirrors-partial);
                                 only used to add a hint to warnings and notifications
 EOF
 }
@@ -170,15 +174,22 @@ desktop_notify() {
 }
 
 # Hint for the user when hm-daemon blocks the programs that wait for this run (its DENY_ON
-# mode). hm-daemon passes HM_DENY_ON (failure|partial) and HM_DENY_RETRY (its cooldown in
-# seconds); outside of the daemon both are unset and nothing is printed.
-# $1 = severity of this run's outcome: failure (exit 1) | partial (exit 2). A partial result
-# blocks only in DENY_ON=partial; a failure blocks in both modes.
+# mode). hm-daemon passes HM_DENY_ON (failure|partial|mirrors|mirrors-partial) and
+# HM_DENY_RETRY (its cooldown in seconds); outside of the daemon both are unset and nothing
+# is printed.
+# $1 = severity of this run's outcome:
+#   failure (exit 1: error, or no healthy mirror although the API works)
+#   partial (exit 2: some lists skipped)
+#   api     (exit 3: the mirror status could not be obtained)
+# The case below mirrors DENY_MODES of hm-daemon: which mode blocks for which severity.
 deny_hint() {
     local retry="${HM_DENY_RETRY:-}"
 
     case "${HM_DENY_ON:-}:$1" in
-        failure:failure|partial:failure|partial:partial) ;;
+        failure:failure|failure:api|\
+        partial:failure|partial:api|partial:partial|\
+        mirrors:failure|\
+        mirrors-partial:failure|mirrors-partial:partial) ;;
         *) return 0 ;;
     esac
 
@@ -200,6 +211,19 @@ die() {
     [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
     desktop_notify 'hm: mirror check failed' "$*${hint:+ $hint}"
     exit 1
+}
+
+# Like die, but for "the mirror status could not be obtained" (an API is down, unusable or
+# its data cannot be parsed): exit status 3, so that hm-daemon can tell it from "the API
+# works but there is no healthy mirror" (exit status 1).
+die_api() {
+    local hint
+
+    printf 'hm: %s\n' "$*" >&2
+    hint=$(deny_hint api)
+    [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
+    desktop_notify 'hm: mirror status unavailable' "$*${hint:+ $hint}"
+    exit 3
 }
 
 if [[ "$NOTIFY_TEST" -eq 1 ]]; then
@@ -633,6 +657,8 @@ fi
 # API downloads and validation
 # Malformed single entries are skipped by the jq filters (and reported); a
 # response in which more than half of the entries are malformed is refused.
+# Everything that goes wrong while obtaining or parsing the mirror status ends
+# with die_api (exit status 3), not with die (exit status 1).
 # ---------------------------------------------------------------------------
 
 new_temp || die 'cannot create temporary file'
@@ -720,20 +746,20 @@ fetch_cachyos_api() {
 
 # CachyOS: the primary API first, the fallback only if the primary cannot be used (download
 # failed, not valid mirror data, or more than half of its entries unusable). Both failing is
-# an error. Using the fallback is not: it is reported on stderr (hm-daemon logs it to the
-# journal) and the run continues with the same data.
+# an error (exit status 3). Using the fallback is not: it is reported on stderr (hm-daemon
+# logs it to the journal) and the run continues with the same data.
 if ! fetch_cachyos_api "$CACHYOS_API" "$JSON_CACHYOS"; then
     primary_error=$FETCH_ERROR
 
     fetch_cachyos_api "$CACHYOS_API_FALLBACK" "$JSON_CACHYOS" ||
-        die "cannot get CachyOS mirror status: $CACHYOS_API: $primary_error; $CACHYOS_API_FALLBACK: $FETCH_ERROR"
+        die_api "cannot get CachyOS mirror status: $CACHYOS_API: $primary_error; $CACHYOS_API_FALLBACK: $FETCH_ERROR"
 
     printf 'hm: warning: CachyOS API %s is not usable (%s); using the fallback %s\n' \
         "$CACHYOS_API" "$primary_error" "$CACHYOS_API_FALLBACK" >&2
 fi
 
 curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" ||
-    die 'cannot download Arch Linux mirror status'
+    die_api 'cannot download Arch Linux mirror status'
 
 jq -e '
     (.urls | type == "array")
@@ -741,15 +767,15 @@ jq -e '
            | select((.url | type == "string") and .protocol == "https")
          ] | length) > 0
 ' "$JSON_ARCH" >/dev/null ||
-    die 'invalid or incomplete Arch Linux API response'
+    die_api 'invalid or incomplete Arch Linux API response'
 
 counts=$(jq -r '
     [ (.urls | length),
       ([ .urls[]
          | select((.url | type == "string") and (.protocol | type == "string"))
        ] | length) ] | @tsv
-' "$JSON_ARCH") || die 'cannot count the entries of the Arch Linux API response'
-check_entries 'Arch Linux' "$counts" || die "$FETCH_ERROR"
+' "$JSON_ARCH") || die_api 'cannot count the entries of the Arch Linux API response'
+check_entries 'Arch Linux' "$counts" || die_api "$FETCH_ERROR"
 
 # Validate URLs without treating data as sed/regex syntax.
 validate_urls() {
@@ -779,7 +805,7 @@ jq -r '
     | sub("/+$"; "")
     | select(test("^[^[:cntrl:]]+$"))
 ' "$JSON_CACHYOS" > "$KNOWN_CACHYOS" ||
-    die 'cannot parse CachyOS mirror list'
+    die_api 'cannot parse CachyOS mirror list'
 
 jq -r '
     .urls[]
@@ -788,7 +814,7 @@ jq -r '
     | sub("/+$"; "")
     | select(test("^[^[:cntrl:]]+$"))
 ' "$JSON_ARCH" > "$KNOWN_ARCH" ||
-    die 'cannot parse Arch Linux mirror list'
+    die_api 'cannot parse Arch Linux mirror list'
 
 # ---------------------------------------------------------------------------
 # CachyOS health lists
@@ -816,10 +842,10 @@ for architecture in x86_64 x86_64_v3 x86_64_v4; do
         | .url
         | sub("/+$"; "")
     ' "$JSON_CACHYOS" > "$output" ||
-        die "cannot parse CachyOS mirror status ($architecture)"
+        die_api "cannot parse CachyOS mirror status ($architecture)"
 
     validate_urls "$output" ||
-        die "invalid CachyOS URL ($architecture)"
+        die_api "invalid CachyOS URL ($architecture)"
 done
 
 # ---------------------------------------------------------------------------
@@ -840,10 +866,10 @@ jq -r '
     | .url
     | sub("/+$"; "")
 ' "$JSON_ARCH" > "$ARCH_MIRRORS" ||
-    die 'cannot parse Arch Linux mirror status'
+    die_api 'cannot parse Arch Linux mirror status'
 
 validate_urls "$ARCH_MIRRORS" ||
-    die 'invalid Arch Linux mirror URL'
+    die_api 'invalid Arch Linux mirror URL'
 
 # ---------------------------------------------------------------------------
 # Build and validate all candidates before touching any mirrorlist.
@@ -1014,7 +1040,7 @@ report_skipped() {
     fi
 }
 
-# Nothing can be updated: same outcome as a failed run (exit status 1).
+# Nothing can be updated although the API works (no healthy mirror anywhere): exit status 1.
 if [[ "$skipped_count" -eq "${#MIRRORLISTS[@]}" ]]; then
     print_summary
     report_skipped all
@@ -1030,8 +1056,9 @@ fi
 print_summary
 
 # Some lists were skipped, the others are done: warn and exit with status 2, so that callers
-# (the "up" function, hm-daemon) can tell this apart from a complete success (0) and from
-# a failure (1). This also applies to --dry-run, so that a preview agrees with a real run.
+# (the "up" function, hm-daemon) can tell this apart from a complete success (0), from
+# a failure (1) and from an unavailable mirror status (3). This also applies to --dry-run,
+# so that a preview agrees with a real run.
 if [[ "$skipped_count" -gt 0 ]]; then
     report_skipped partial
     exit 2
