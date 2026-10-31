@@ -1,16 +1,22 @@
 #!/usr/bin/env bash
-# test-hm-api.sh - test the CachyOS API fallback of hm and compare the two APIs.
+# test-hm-api.sh - test the CachyOS API fallback of hm, the independence of the two APIs
+# and compare the two CachyOS APIs.
 #
 # Usage:
 #   ./test-hm-api.sh [--offline] [path/to/hm]
 #
-# Part 1: offline fallback tests using a stub curl.
-# Part 2: compares data and hm decisions from both real APIs.
-# Part 3: measures response times of both real APIs.
+# Part 1: offline fallback tests using a stub curl (tests 1-6).
+# Part 2: compares data and hm decisions from both real APIs (test 7).
+# Part 3: measures response times of both real APIs (test 8).
+# Part 4: offline tests of the independence of the APIs (tests 9-12): an outage of one API
+#         leaves the lists of the other API working, lists without an API are never touched.
 #
 # No root needed. hm is only run with --dry-run.
 # Reads /etc/pacman.conf and included mirrorlists.
 # Nothing else on the system is modified.
+#
+# Tests that need a certain kind of list (CachyOS, Arch Linux, other) are skipped when
+# the mirrorlists of this system do not have it.
 
 set -u
 export LC_ALL=C
@@ -36,7 +42,7 @@ HM=$(readlink -f "${HM:-${SELF%/*}/hm}")
     exit 1
 }
 
-for tool in curl jq sed grep cmp diff sort awk uniq; do
+for tool in curl jq sed grep cmp diff sort awk uniq basename; do
     command -v "$tool" >/dev/null 2>&1 || {
         echo "missing tool: $tool" >&2
         exit 1
@@ -96,6 +102,65 @@ note() {
 has() {
     grep -qF -- "$2" <<<"$1"
 }
+
+# ---------------------------------------------------------------------------
+# The mirrorlists of this system, classified the way hm does it (list_kind and the
+# name of the list in the summary). Keep this in step with hm.
+#   cachyos: the name contains "cachyos"      -> CachyOS API
+#   arch:    mirrorlist, arch-mirrorlist      -> Arch Linux API
+#   other:   everything else (chaotic, ...)   -> no API, never touched
+# ---------------------------------------------------------------------------
+
+list_kind() {
+    local base
+
+    base=$(basename -- "$1")
+    base="${base%-mirrorlist}"
+    [[ "$base" == mirrorlist ]] && base=arch
+
+    if [[ "${1,,}" == *cachyos* ]]; then
+        echo cachyos
+    elif [[ "$base" == arch || "$base" == archlinux ]]; then
+        echo arch
+    else
+        echo other
+    fi
+}
+
+list_name() {
+    local name
+
+    name=$(basename -- "$1")
+    [[ "$name" == mirrorlist ]] && name=arch
+    echo "${name%-mirrorlist}"
+}
+
+# "active/disabled" Server counts of a file, as hm shows them for a list it left unchanged
+counts_of() {
+    printf '%s/%s' \
+        "$(grep -c '^Server = ' "$1" || true)" \
+        "$(grep -c '^#UH#Server = ' "$1" || true)"
+}
+
+declare -a LIST_PATH=() LIST_KIND=() LIST_NAME=()
+HAS_CACHYOS=0
+HAS_ARCH=0
+HAS_OTHER=0
+
+while IFS= read -r path; do
+    [[ -n $path ]] || continue
+    kind=$(list_kind "$path")
+    LIST_PATH+=("$path")
+    LIST_KIND+=("$kind")
+    LIST_NAME+=("$(list_name "$path")")
+    case $kind in
+        cachyos) HAS_CACHYOS=1 ;;
+        arch)    HAS_ARCH=1 ;;
+        other)   HAS_OTHER=1 ;;
+    esac
+done < <("$HM" --list)
+
+note "mirrorlists of this system: $(for i in "${!LIST_PATH[@]}"; do printf '%s(%s) ' "${LIST_NAME[$i]}" "${LIST_KIND[$i]}"; done)"
 
 # ---------------------------------------------------------------------------
 # Canned data and stub curl
@@ -180,7 +245,8 @@ EOF
 chmod +x "$T/bin/curl"
 
 # run_hm PRIMARY FALLBACK [ARCH]
-# Sets OUT, ERR and RC.
+# Each argument is a file with canned data, "fail" (download error) or "bad" (not mirror
+# data). Sets OUT, ERR and RC.
 
 run_hm() {
     : > "$LOG"
@@ -208,97 +274,136 @@ requested() {
 
 echo "== 1. primary API works: fallback is neither requested nor mentioned"
 
-run_hm "$T/cachyos.json" fail
-BASE_OUT=$OUT
-
-requested "$PRIMARY" \
-    && ok "primary API requested" \
-    || bad "primary API not requested"
-
-requested "$FALLBACK" \
-    && bad "fallback API requested although primary works" \
-    || ok "fallback API not requested"
-
-has "$ERR" 'fallback' \
-    && bad "hm mentions a fallback: $ERR" \
-    || ok "no fallback message"
-
-echo "== 2. primary download fails: fallback is used"
-
-run_hm fail "$T/cachyos.json"
-
-requested "$FALLBACK" \
-    && ok "fallback API requested" \
-    || bad "fallback API not requested"
-
-has "$ERR" 'using the fallback' \
-    && ok "message says fallback is used" \
-    || bad "message missing: $ERR"
-
-has "$ERR" "$PRIMARY" && has "$ERR" "$FALLBACK" \
-    && ok "message names both addresses" \
-    || bad "message does not name both addresses"
-
-has "$ERR" '503' \
-    && ok "message contains the curl error" \
-    || bad "reason missing"
-
-if [[ $OUT == "$BASE_OUT" ]]; then
-    ok "same result as with primary API"
+if (( ! HAS_CACHYOS )); then
+    skip "no CachyOS mirrorlist on this system: tests 1-4 need one"
+    BASE_OUT=
 else
-    bad "result differs from primary API"
-    diff <(printf '%s\n' "$BASE_OUT") <(printf '%s\n' "$OUT")
+    run_hm "$T/cachyos.json" fail
+    BASE_OUT=$OUT
+
+    requested "$PRIMARY" \
+        && ok "primary API requested" \
+        || bad "primary API not requested"
+
+    requested "$FALLBACK" \
+        && bad "fallback API requested although primary works" \
+        || ok "fallback API not requested"
+
+    has "$ERR" 'fallback' \
+        && bad "hm mentions a fallback: $ERR" \
+        || ok "no fallback message"
+
+    echo "== 2. primary download fails: fallback is used"
+
+    run_hm fail "$T/cachyos.json"
+
+    requested "$FALLBACK" \
+        && ok "fallback API requested" \
+        || bad "fallback API not requested"
+
+    has "$ERR" 'using the fallback' \
+        && ok "message says fallback is used" \
+        || bad "message missing: $ERR"
+
+    has "$ERR" "$PRIMARY" && has "$ERR" "$FALLBACK" \
+        && ok "message names both addresses" \
+        || bad "message does not name both addresses"
+
+    has "$ERR" '503' \
+        && ok "message contains the curl error" \
+        || bad "reason missing"
+
+    if [[ $OUT == "$BASE_OUT" ]]; then
+        ok "same result as with primary API"
+    else
+        bad "result differs from primary API"
+        diff <(printf '%s\n' "$BASE_OUT") <(printf '%s\n' "$OUT")
+    fi
+
+    echo "== 3. primary returns invalid mirror data: fallback is used"
+
+    run_hm bad "$T/cachyos.json"
+
+    has "$ERR" 'using the fallback' && has "$ERR" 'invalid or incomplete response' \
+        && ok "fallback used, reason named" \
+        || bad "unexpected message: $ERR"
+
+    [[ $OUT == "$BASE_OUT" ]] \
+        && ok "same result as with primary API" \
+        || bad "result differs"
+
+    echo "== 4. primary has more than half of its entries malformed"
+
+    run_hm "$T/broken.json" "$T/cachyos.json"
+
+    has "$ERR" 'using the fallback' && has "$ERR" 'looks broken' \
+        && ok "fallback used, reason named" \
+        || bad "unexpected message: $ERR"
+
+    [[ $OUT == "$BASE_OUT" ]] \
+        && ok "same result as with primary API" \
+        || bad "result differs"
 fi
 
-echo "== 3. primary returns invalid mirror data: fallback is used"
+echo "== 5. every needed API unusable: no list can be checked, exit 3"
 
-run_hm bad "$T/cachyos.json"
+if (( ! HAS_CACHYOS && ! HAS_ARCH )); then
+    skip "no CachyOS or Arch Linux mirrorlist on this system"
+else
+    run_hm fail bad fail
 
-has "$ERR" 'using the fallback' && has "$ERR" 'invalid or incomplete response' \
-    && ok "fallback used, reason named" \
-    || bad "unexpected message: $ERR"
+    [[ $RC -eq 3 ]] \
+        && ok "exit status 3 (mirror status unavailable)" \
+        || bad "exit status $RC (expected 3)"
 
-[[ $OUT == "$BASE_OUT" ]] \
-    && ok "same result as with primary API" \
-    || bad "result differs"
+    has "$ERR" 'cannot get the mirror status:' \
+        && ok "error says that the mirror status cannot be obtained" \
+        || bad "unexpected message: $ERR"
 
-echo "== 4. primary has more than half of its entries malformed"
+    if (( HAS_CACHYOS )); then
+        has "$ERR" 'CachyOS: ' && has "$ERR" "$PRIMARY" && has "$ERR" "$FALLBACK" \
+            && ok "error names CachyOS and both of its addresses" \
+            || bad "CachyOS error incomplete: $ERR"
+    else
+        has "$ERR" 'CachyOS: ' \
+            && bad "error mentions CachyOS although no CachyOS list exists: $ERR" \
+            || ok "CachyOS not mentioned (no CachyOS list on this system)"
+    fi
 
-run_hm "$T/broken.json" "$T/cachyos.json"
+    if (( HAS_ARCH )); then
+        has "$ERR" 'Arch Linux: ' \
+            && ok "error names the Arch Linux API" \
+            || bad "Arch Linux error missing: $ERR"
+    else
+        has "$ERR" 'Arch Linux: ' \
+            && bad "error mentions Arch Linux although no Arch list exists: $ERR" \
+            || ok "Arch Linux not mentioned (no Arch list on this system)"
+    fi
 
-has "$ERR" 'using the fallback' && has "$ERR" 'looks broken' \
-    && ok "fallback used, reason named" \
-    || bad "unexpected message: $ERR"
+    has "$ERR" 'using the fallback' \
+        && bad "claims to use the fallback" \
+        || ok "does not claim to use the fallback"
+fi
 
-[[ $OUT == "$BASE_OUT" ]] \
-    && ok "same result as with primary API" \
-    || bad "result differs"
+echo "== 6. Arch Linux API has no fallback: its failure makes the Arch list unavailable (exit 3)"
 
-echo "== 5. both APIs unusable: error, exit 3 (mirror status unavailable)"
+if (( ! HAS_ARCH )); then
+    skip "no Arch Linux mirrorlist on this system"
+else
+    run_hm "$T/cachyos.json" fail fail
 
-run_hm fail bad
+    [[ $RC -eq 3 ]] \
+        && ok "exit status 3" \
+        || bad "exit status $RC (expected 3): $ERR"
 
-[[ $RC -eq 3 ]] \
-    && ok "exit status 3 (mirror status unavailable)" \
-    || bad "exit status $RC (expected 3)"
+    has "$ERR" 'Arch Linux: download failed' \
+        && ok "error names the Arch Linux API and the reason" \
+        || bad "unexpected message: $ERR"
 
-has "$ERR" 'cannot get CachyOS mirror status' &&
-    has "$ERR" "$PRIMARY" &&
-    has "$ERR" "$FALLBACK" \
-    && ok "error names both addresses" \
-    || bad "unexpected message: $ERR"
-
-has "$ERR" 'using the fallback' \
-    && bad "claims to use the fallback" \
-    || ok "does not claim to use the fallback"
-
-echo "== 6. Arch Linux API has no fallback (failure is exit 3)"
-
-run_hm "$T/cachyos.json" fail fail
-
-[[ $RC -eq 3 ]] && has "$ERR" 'cannot download Arch Linux mirror status' \
-    && ok "exit 3 with the Arch error" \
-    || bad "exit $RC: $ERR"
+    [[ $(grep -cxF -- "$ARCH" "$LOG") -eq 1 ]] \
+        && ok "the Arch Linux API was requested once (no fallback address)" \
+        || bad "the Arch Linux API was requested $(grep -cxF -- "$ARCH" "$LOG") times"
+fi
 
 # ---------------------------------------------------------------------------
 # Part 2: compare the two real APIs
@@ -498,6 +603,174 @@ else
     fi
 
     note "each download uses a new curl process and a fresh connection; timings never fail the test"
+fi
+
+# ---------------------------------------------------------------------------
+# Part 4: the two APIs are independent of each other
+# ---------------------------------------------------------------------------
+
+# The entry of the list $1 in the mirror summary of the last run (empty if there is none).
+summary_entry() {
+    grep -m1 '^==== mirror summary' <<<"$OUT" |
+        sed -e 's/^==== mirror summary ([^)]*): //' -e 's/ ====$//' |
+        tr '|' '\n' |
+        sed -e 's/^ *//' -e 's/ *$//' |
+        awk -v n="$1" 'index($0, n " (") == 1 { print; exit }'
+}
+
+# Check the last run (an outage of the API of kind $1, the other API working):
+#   - the lists of the kind $1 are left as they are, marked "ERR" with their
+#     current counts, reported as left as they are and not part of an update;
+#   - the lists of the other API are evaluated (an entry that is not "unavailable");
+#   - the other lists (no API) show only "name (active)" and are never part of an update.
+# Prints every problem found; returns 1 if there is any.
+verify_state() {
+    local down=$1 i name path kind entry problems=0
+
+    for i in "${!LIST_PATH[@]}"; do
+        name=${LIST_NAME[$i]}
+        path=${LIST_PATH[$i]}
+        kind=${LIST_KIND[$i]}
+        entry=$(summary_entry "$name")
+
+        if [[ $kind == "$down" ]]; then
+            if [[ $entry != "$name ($(counts_of "$path"), ERR)" ]]; then
+                printf '      %s: expected "%s (%s, ERR)", got "%s"\n' \
+                    "$name" "$name" "$(counts_of "$path")" "$entry"
+                problems=1
+            fi
+            if ! has "$OUT" "hm: left as it is (mirror status unavailable): $name"; then
+                printf '      %s: not reported as left as it is\n' "$name"
+                problems=1
+            fi
+            if has "$OUT" "hm: would update $path"; then
+                printf '      %s: would be updated although its API is unavailable\n' "$name"
+                problems=1
+            fi
+        elif [[ $kind == other ]]; then
+            if [[ $entry != "$name ($(grep -c '^Server = ' "$path" || true))" ]]; then
+                printf '      %s: expected "%s (N)", got "%s"\n' "$name" "$name" "$entry"
+                problems=1
+            fi
+            if has "$OUT" "hm: left as it is (mirror status unavailable): $name" ||
+               has "$OUT" "hm: would update $path"; then
+                printf '      %s: a list without an API was touched or called unavailable\n' "$name"
+                problems=1
+            fi
+        else
+            if [[ -z $entry || $entry == *', ERR)' ]]; then
+                printf '      %s: should have been evaluated, got "%s"\n' "$name" "$entry"
+                problems=1
+            fi
+            if has "$OUT" "hm: left as it is (mirror status unavailable): $name"; then
+                printf '      %s: reported unavailable although its API works\n' "$name"
+                problems=1
+            fi
+        fi
+    done
+
+    return "$problems"
+}
+
+echo "== 9. Arch Linux API down, CachyOS works: CachyOS lists are checked, Arch list unavailable"
+
+if (( ! HAS_ARCH || ! HAS_CACHYOS )); then
+    skip "needs both a CachyOS and an Arch Linux mirrorlist on this system"
+else
+    run_hm "$T/cachyos.json" fail fail
+
+    [[ $RC -eq 3 ]] \
+        && ok "exit status 3" \
+        || bad "exit status $RC (expected 3): $ERR"
+
+    if verify_state arch; then
+        ok "Arch lists unavailable and untouched, CachyOS lists evaluated, other lists untouched"
+    else
+        bad "wrong state of the lists (see above)"
+    fi
+
+    has "$ERR" 'mirror status unavailable' && has "$ERR" 'Arch Linux: download failed' \
+        && ok "warning names the Arch Linux API and the reason" \
+        || bad "unexpected message: $ERR"
+
+    has "$ERR" 'CachyOS: ' \
+        && bad "warning mentions CachyOS: $ERR" \
+        || ok "CachyOS is not reported as failed"
+fi
+
+echo "== 10. both CachyOS addresses down, Arch Linux works: Arch list is checked, CachyOS lists unavailable"
+
+if (( ! HAS_ARCH || ! HAS_CACHYOS )); then
+    skip "needs both a CachyOS and an Arch Linux mirrorlist on this system"
+else
+    run_hm fail fail "$T/arch.json"
+
+    [[ $RC -eq 3 ]] \
+        && ok "exit status 3" \
+        || bad "exit status $RC (expected 3): $ERR"
+
+    if verify_state cachyos; then
+        ok "CachyOS lists unavailable and untouched, Arch list evaluated, other lists untouched"
+    else
+        bad "wrong state of the lists (see above)"
+    fi
+
+    has "$ERR" 'mirror status unavailable' && has "$ERR" 'CachyOS: ' &&
+        has "$ERR" "$PRIMARY" && has "$ERR" "$FALLBACK" \
+        && ok "warning names CachyOS and both addresses" \
+        || bad "unexpected message: $ERR"
+
+    has "$ERR" 'Arch Linux: ' \
+        && bad "warning mentions the Arch Linux API: $ERR" \
+        || ok "Arch Linux is not reported as failed"
+fi
+
+echo "== 11. lists without an API are never touched and never unavailable"
+
+if (( ! HAS_OTHER )); then
+    skip "no mirrorlist without an API (chaotic, ...) on this system"
+elif (( HAS_CACHYOS )); then
+    run_hm "$T/cachyos.json" fail fail    # the Arch Linux API is down
+    if verify_state arch; then
+        ok "other lists show only their number of active mirrors during an Arch Linux outage"
+    else
+        bad "wrong state of the lists (see above)"
+    fi
+elif (( HAS_ARCH )); then
+    run_hm fail fail "$T/arch.json"       # both CachyOS addresses are down
+    if verify_state cachyos; then
+        ok "other lists show only their number of active mirrors during a CachyOS outage"
+    else
+        bad "wrong state of the lists (see above)"
+    fi
+else
+    skip "no CachyOS or Arch Linux mirrorlist on this system"
+fi
+
+echo "== 12. an API that no list uses is not downloaded"
+
+if (( HAS_CACHYOS && HAS_ARCH )); then
+    skip "this system has both CachyOS and Arch Linux lists"
+elif (( ! HAS_CACHYOS && ! HAS_ARCH )); then
+    skip "no CachyOS or Arch Linux mirrorlist on this system"
+elif (( HAS_CACHYOS )); then
+    run_hm "$T/cachyos.json" fail fail
+    requested "$ARCH" \
+        && bad "the Arch Linux API was requested although no Arch list exists" \
+        || ok "the Arch Linux API was not requested"
+    [[ $RC -ne 3 ]] \
+        && ok "an unusable Arch Linux API does not matter (exit status $RC)" \
+        || bad "exit status 3 although only the unused API failed: $ERR"
+else
+    run_hm fail fail "$T/arch.json"
+    if requested "$PRIMARY" || requested "$FALLBACK"; then
+        bad "a CachyOS address was requested although no CachyOS list exists"
+    else
+        ok "no CachyOS address was requested"
+    fi
+    [[ $RC -ne 3 ]] \
+        && ok "an unusable CachyOS API does not matter (exit status $RC)" \
+        || bad "exit status 3 although only the unused API failed: $ERR"
 fi
 
 echo

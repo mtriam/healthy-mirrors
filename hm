@@ -17,8 +17,10 @@ Exit status:
   1   error, or no mirror list could be updated although the API works
       (nothing was changed)
   2   some mirror lists were skipped (left unchanged), the others were updated
-  3   the mirror status could not be obtained (API unreachable, unusable or
-      unparsable); nothing was changed
+  3   the mirror status could not be obtained for at least one API (CachyOS or
+      Arch Linux): the lists of that API were left unchanged, the lists of the
+      other API were still checked and updated; if no list could be checked at
+      all, nothing was changed
 
 Environment:
   HM_NOTIFY=auto|always|never   desktop notifications on errors
@@ -180,7 +182,7 @@ desktop_notify() {
 # $1 = severity of this run's outcome:
 #   failure (exit 1: error, or no healthy mirror although the API works)
 #   partial (exit 2: some lists skipped)
-#   api     (exit 3: the mirror status could not be obtained)
+#   api     (exit 3: the mirror status of at least one API could not be obtained)
 # The case below mirrors DENY_MODES of hm-daemon: which mode blocks for which severity.
 deny_hint() {
     local retry="${HM_DENY_RETRY:-}"
@@ -213,9 +215,10 @@ die() {
     exit 1
 }
 
-# Like die, but for "the mirror status could not be obtained" (an API is down, unusable or
-# its data cannot be parsed): exit status 3, so that hm-daemon can tell it from "the API
-# works but there is no healthy mirror" (exit status 1).
+# Like die, but for "the mirror status could not be obtained" (every API that is needed is
+# down, unusable or its data cannot be parsed, so no list could be checked): exit status 3,
+# so that hm-daemon can tell it from "the API works but there is no healthy mirror"
+# (exit status 1).
 die_api() {
     local hint
 
@@ -423,6 +426,7 @@ describe_changes() {   # $1 = current file, $2 = candidate file (same lines, onl
 }
 
 declare -a OTHER_SERVERS=()
+declare -a UNAVAILABLE=()   # names of the lists whose API is unavailable (left unchanged)
 
 report_pending() {
     local i f
@@ -440,6 +444,10 @@ report_pending() {
 
     for f in "${OTHER_SERVERS[@]}"; do
         printf 'hm: left as it is (not known to the API): %s\n' "$f"
+    done
+
+    for f in "${UNAVAILABLE[@]}"; do
+        printf 'hm: left as it is (mirror status unavailable): %s\n' "$f"
     done
 
     while IFS= read -r f; do
@@ -657,8 +665,12 @@ fi
 # API downloads and validation
 # Malformed single entries are skipped by the jq filters (and reported); a
 # response in which more than half of the entries are malformed is refused.
-# Everything that goes wrong while obtaining or parsing the mirror status ends
-# with die_api (exit status 3), not with die (exit status 1).
+#
+# The CachyOS and Arch Linux APIs are independent of each other: when one of them
+# cannot be used, the lists that depend on it are left unchanged and marked
+# "unavailable"; the lists of the other API are checked and updated as usual. Only when
+# no list could be checked at all does the run end with die_api. In every case where
+# the mirror status of some API is missing, the exit status is 3.
 # ---------------------------------------------------------------------------
 
 new_temp || die 'cannot create temporary file'
@@ -678,8 +690,9 @@ KNOWN_CACHYOS=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
 KNOWN_ARCH=$NEW_TEMP_PATH
 
-# Reason why the last API response could not be used (set by check_entries and
-# fetch_cachyos_api, which do not exit on their own so that the caller can decide).
+# Reason why the last API response could not be used (set by check_entries,
+# fetch_cachyos_api, fetch_arch_api, load_cachyos and load_arch, which do not exit on
+# their own so that the caller can decide).
 FETCH_ERROR=''
 
 # $1 = API name, $2 = "total usable" entry counts
@@ -744,38 +757,41 @@ fetch_cachyos_api() {
     check_entries CachyOS "$counts"
 }
 
-# CachyOS: the primary API first, the fallback only if the primary cannot be used (download
-# failed, not valid mirror data, or more than half of its entries unusable). Both failing is
-# an error (exit status 3). Using the fallback is not: it is reported on stderr (hm-daemon
-# logs it to the journal) and the run continues with the same data.
-if ! fetch_cachyos_api "$CACHYOS_API" "$JSON_CACHYOS"; then
-    primary_error=$FETCH_ERROR
+# Download the Arch Linux mirror status into $JSON_ARCH and check that the response is
+# usable. Returns 0 if it is; returns 1 and sets FETCH_ERROR if it is not.
+fetch_arch_api() {
+    local out counts
 
-    fetch_cachyos_api "$CACHYOS_API_FALLBACK" "$JSON_CACHYOS" ||
-        die_api "cannot get CachyOS mirror status: $CACHYOS_API: $primary_error; $CACHYOS_API_FALLBACK: $FETCH_ERROR"
+    FETCH_ERROR=''
 
-    printf 'hm: warning: CachyOS API %s is not usable (%s); using the fallback %s\n' \
-        "$CACHYOS_API" "$primary_error" "$CACHYOS_API_FALLBACK" >&2
-fi
+    if ! out=$(curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" 2>&1); then
+        out=${out//$'\n'/ }
+        FETCH_ERROR="download failed${out:+: $out}"
+        return 1
+    fi
 
-curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" ||
-    die_api 'cannot download Arch Linux mirror status'
+    if ! jq -e '
+        (.urls | type == "array")
+        and ([ .urls[]
+               | select((.url | type == "string") and .protocol == "https")
+             ] | length) > 0
+    ' "$JSON_ARCH" >/dev/null 2>&1; then
+        FETCH_ERROR='invalid or incomplete response'
+        return 1
+    fi
 
-jq -e '
-    (.urls | type == "array")
-    and ([ .urls[]
-           | select((.url | type == "string") and .protocol == "https")
-         ] | length) > 0
-' "$JSON_ARCH" >/dev/null ||
-    die_api 'invalid or incomplete Arch Linux API response'
+    if ! counts=$(jq -r '
+        [ (.urls | length),
+          ([ .urls[]
+             | select((.url | type == "string") and (.protocol | type == "string"))
+           ] | length) ] | @tsv
+    ' "$JSON_ARCH" 2>/dev/null); then
+        FETCH_ERROR='cannot count the entries of the Arch Linux API response'
+        return 1
+    fi
 
-counts=$(jq -r '
-    [ (.urls | length),
-      ([ .urls[]
-         | select((.url | type == "string") and (.protocol | type == "string"))
-       ] | length) ] | @tsv
-' "$JSON_ARCH") || die_api 'cannot count the entries of the Arch Linux API response'
-check_entries 'Arch Linux' "$counts" || die_api "$FETCH_ERROR"
+    check_entries 'Arch Linux' "$counts"
+}
 
 # Validate URLs without treating data as sed/regex syntax.
 validate_urls() {
@@ -793,89 +809,171 @@ validate_urls() {
     return 0
 }
 
-# ---------------------------------------------------------------------------
-# Known mirrors: every mirror the APIs list, healthy or not. A mirror that is
-# not known (local cache, own server, company mirror, ...) is never touched.
-# ---------------------------------------------------------------------------
+# Which mirrorlists belong to the CachyOS API (their name contains "cachyos"); all others
+# belong to the Arch Linux API.
+is_cachyos_list() { [[ "${1,,}" == *cachyos* ]]; }
 
-jq -r '
-    .mirrors[]
-    | select(.url | type == "string")
-    | .url
-    | sub("/+$"; "")
-    | select(test("^[^[:cntrl:]]+$"))
-' "$JSON_CACHYOS" > "$KNOWN_CACHYOS" ||
-    die_api 'cannot parse CachyOS mirror list'
+# Kind of a managed list: cachyos, arch, or other (other = no API, never touched)
+list_kind() {
+    local base
+    base=$(basename -- "$1")
+    base="${base%-mirrorlist}"
+    [[ "$base" == mirrorlist ]] && base=arch
+    if [[ "${1,,}" == *cachyos* ]]; then
+        echo cachyos
+    elif [[ "$base" == arch || "$base" == archlinux ]]; then
+        echo arch
+    else
+        echo other
+    fi
+}
 
-jq -r '
-    .urls[]
-    | select(.url | type == "string")
-    | .url
-    | sub("/+$"; "")
-    | select(test("^[^[:cntrl:]]+$"))
-' "$JSON_ARCH" > "$KNOWN_ARCH" ||
-    die_api 'cannot parse Arch Linux mirror list'
-
-# ---------------------------------------------------------------------------
-# CachyOS health lists
-# An empty list is not an error here: it only matters for a mirrorlist that
-# uses it (such a list is skipped below, the other lists are still updated).
-# ---------------------------------------------------------------------------
-
-for architecture in x86_64 x86_64_v3 x86_64_v4; do
-    output="$TMP"
-    [[ "$architecture" == x86_64_v3 ]] && output="$TMP_V3"
-    [[ "$architecture" == x86_64_v4 ]] && output="$TMP_V4"
-
-    jq -r --arg architecture "$architecture" '
-        .mirrors[]
-        | select((.url | type == "string") and (.checks | type == "array"))
-        | select(.url | startswith("https://"))
-        | [ .checks[]
-            | select(
-                (.path | type == "string")
-                and (.path | startswith($architecture + "/"))
-            )
-            | .status
-          ] as $checks
-        | select(($checks | length) > 0 and all($checks[]; . == "synced"))
-        | .url
-        | sub("/+$"; "")
-    ' "$JSON_CACHYOS" > "$output" ||
-        die_api "cannot parse CachyOS mirror status ($architecture)"
-
-    validate_urls "$output" ||
-        die_api "invalid CachyOS URL ($architecture)"
+# Only the APIs that some managed list needs are downloaded: a CachyOS outage must not
+# matter to someone who only has Arch lists, and the other way round.
+NEED_CACHYOS=0
+NEED_ARCH=0
+for mirrorlist in "${MIRRORLISTS[@]}"; do
+    case "$(list_kind "$mirrorlist")" in cachyos) NEED_CACHYOS=1 ;; arch) NEED_ARCH=1 ;; esac
 done
 
-# ---------------------------------------------------------------------------
-# Arch Linux health list
-# ---------------------------------------------------------------------------
+CACHYOS_OK=0
+ARCH_OK=0
+declare -a API_ERRORS=()   # "API: reason" for every API that could not be used
 
-jq -r '
-    .urls[]
-    | select(
-        (.url | type == "string")
-        and .protocol == "https"
-        and .active == true
-        and .last_sync != null
-        and .completion_pct == 1.0
-        and (.delay | type == "number")
-        and .delay < 3600
-    )
-    | .url
-    | sub("/+$"; "")
-' "$JSON_ARCH" > "$ARCH_MIRRORS" ||
-    die_api 'cannot parse Arch Linux mirror status'
+# Everything that is needed from the CachyOS API: the download (primary address, then the
+# fallback), the known mirrors and the healthy mirrors per architecture. Returns 0 if all
+# of it worked; returns 1 and sets FETCH_ERROR if not. Never exits: the caller decides.
+# Using the fallback is not an error: it is reported on stderr (hm-daemon logs it to the
+# journal) and the run continues with the same data.
+load_cachyos() {
+    local architecture output primary_error
 
-validate_urls "$ARCH_MIRRORS" ||
-    die_api 'invalid Arch Linux mirror URL'
+    if ! fetch_cachyos_api "$CACHYOS_API" "$JSON_CACHYOS"; then
+        primary_error=$FETCH_ERROR
+
+        if ! fetch_cachyos_api "$CACHYOS_API_FALLBACK" "$JSON_CACHYOS"; then
+            FETCH_ERROR="$CACHYOS_API: $primary_error; $CACHYOS_API_FALLBACK: $FETCH_ERROR"
+            return 1
+        fi
+
+        printf 'hm: warning: CachyOS API %s is not usable (%s); using the fallback %s\n' \
+            "$CACHYOS_API" "$primary_error" "$CACHYOS_API_FALLBACK" >&2
+    fi
+
+    # Known mirrors: every mirror the API lists, healthy or not. A mirror that is not
+    # known (local cache, own server, company mirror, ...) is never touched.
+    jq -r '
+        .mirrors[]
+        | select(.url | type == "string")
+        | .url
+        | sub("/+$"; "")
+        | select(test("^[^[:cntrl:]]+$"))
+    ' "$JSON_CACHYOS" > "$KNOWN_CACHYOS" || {
+        FETCH_ERROR='cannot parse CachyOS mirror list'
+        return 1
+    }
+
+    # CachyOS health lists. An empty list is not an error here: it only matters for a
+    # mirrorlist that uses it (such a list is skipped below, the other lists are still
+    # updated).
+    for architecture in x86_64 x86_64_v3 x86_64_v4; do
+        output="$TMP"
+        [[ "$architecture" == x86_64_v3 ]] && output="$TMP_V3"
+        [[ "$architecture" == x86_64_v4 ]] && output="$TMP_V4"
+
+        jq -r --arg architecture "$architecture" '
+            .mirrors[]
+            | select((.url | type == "string") and (.checks | type == "array"))
+            | select(.url | startswith("https://"))
+            | [ .checks[]
+                | select(
+                    (.path | type == "string")
+                    and (.path | startswith($architecture + "/"))
+                )
+                | .status
+              ] as $checks
+            | select(($checks | length) > 0 and all($checks[]; . == "synced"))
+            | .url
+            | sub("/+$"; "")
+        ' "$JSON_CACHYOS" > "$output" || {
+            FETCH_ERROR="cannot parse CachyOS mirror status ($architecture)"
+            return 1
+        }
+
+        validate_urls "$output" || {
+            FETCH_ERROR="invalid CachyOS URL ($architecture)"
+            return 1
+        }
+    done
+
+    return 0
+}
+
+# The same for the Arch Linux API (no fallback address).
+load_arch() {
+    fetch_arch_api || return 1
+
+    jq -r '
+        .urls[]
+        | select(.url | type == "string")
+        | .url
+        | sub("/+$"; "")
+        | select(test("^[^[:cntrl:]]+$"))
+    ' "$JSON_ARCH" > "$KNOWN_ARCH" || {
+        FETCH_ERROR='cannot parse Arch Linux mirror list'
+        return 1
+    }
+
+    jq -r '
+        .urls[]
+        | select(
+            (.url | type == "string")
+            and .protocol == "https"
+            and .active == true
+            and .last_sync != null
+            and .completion_pct == 1.0
+            and (.delay | type == "number")
+            and .delay < 3600
+        )
+        | .url
+        | sub("/+$"; "")
+    ' "$JSON_ARCH" > "$ARCH_MIRRORS" || {
+        FETCH_ERROR='cannot parse Arch Linux mirror status'
+        return 1
+    }
+
+    validate_urls "$ARCH_MIRRORS" || {
+        FETCH_ERROR='invalid Arch Linux mirror URL'
+        return 1
+    }
+
+    return 0
+}
+
+# The two APIs are independent: a failure of one only makes the lists that depend on it
+# "unavailable" (left unchanged, reported below); the other lists are processed as usual.
+if [[ "$NEED_CACHYOS" -eq 1 ]]; then
+    if load_cachyos; then
+        CACHYOS_OK=1
+    else
+        API_ERRORS+=("CachyOS: $FETCH_ERROR")
+    fi
+fi
+
+if [[ "$NEED_ARCH" -eq 1 ]]; then
+    if load_arch; then
+        ARCH_OK=1
+    else
+        API_ERRORS+=("Arch Linux: $FETCH_ERROR")
+    fi
+fi
 
 # ---------------------------------------------------------------------------
 # Build and validate all candidates before touching any mirrorlist.
 #
 # Every list is judged on its own. A list that cannot be updated safely is left exactly
 # as it is (and reported); the other lists are updated as usual:
+#   - the API of the list is unavailable (it cannot be judged at all), or
 #   - no active "Server = " line would be left, or
 #   - the list has mirrors the API knows, but none of them is healthy (unmanaged mirrors
 #     alone are no replacement for them: they cannot be vouched for).
@@ -899,14 +997,66 @@ SUMMARY=''
 SUMMARY_PLAIN=''
 first=1
 skipped_count=0
+unavailable_count=0
+unmanaged_count=0
+
+# A list without an API (chaotic, ...): only its number of active mirrors is shown.
+add_summary_other() {   # name active
+    [[ "$first" -eq 1 ]] || {
+        SUMMARY+=' | '
+        SUMMARY_PLAIN+=' | '
+    }
+
+    SUMMARY+="$1 ($2)"
+    SUMMARY_PLAIN+="$1 ($2)"
+
+    first=0
+}
 declare -a PROBLEMS=()     # "name: reason" for every list that is left unchanged
+
+# $1 name, $2 active, $3 commented, $4 other note, $5 status note (colored), $6 status note (plain)
+add_summary() {
+    [[ "$first" -eq 1 ]] || {
+        SUMMARY+=' | '
+        SUMMARY_PLAIN+=' | '
+    }
+
+    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s%s%s)' \
+        "$1" "$GREEN" "$2" "$RESET" "$RED" "$3" "$RESET" "$4" "$5")
+    SUMMARY_PLAIN+=$(printf '%s (%s/%s%s%s)' "$1" "$2" "$3" "$4" "$6")
+
+    first=0
+}
 
 for mirrorlist in "${MIRRORLISTS[@]}"; do
     name=$(basename "$mirrorlist")
     [[ "$name" == mirrorlist ]] && name=arch
     name="${name%-mirrorlist}"
 
-    if [[ "${mirrorlist,,}" != *cachyos* ]]; then
+    kind=$(list_kind "$mirrorlist")
+
+    if [[ "$kind" == other ]]; then
+        # No API for this list: never touched, only counted.
+        unmanaged_count=$((unmanaged_count + 1))
+        add_summary_other "$name" "$(grep -c '^Server = ' "$mirrorlist" || true)"
+        continue
+    fi
+
+    if [[ "$kind" == cachyos ]]; then api_ok=$CACHYOS_OK; else api_ok=$ARCH_OK; fi
+
+    if [[ "$api_ok" -ne 1 ]]; then
+        # The API of this list is unavailable: leave the list exactly as it is and report
+        # its current state.
+        unavailable_count=$((unavailable_count + 1))
+        UNAVAILABLE+=("$name")
+        add_summary "$name" \
+            "$(grep -c '^Server = ' "$mirrorlist" || true)" \
+            "$(grep -c "^${MARK}Server = " "$mirrorlist" || true)" \
+            '' ", ${WARNING_STYLE}ERR${RESET}" ', ERR'
+        continue
+    fi
+
+    if ! is_cachyos_list "$mirrorlist"; then
         healthy="$ARCH_MIRRORS"
         known="$KNOWN_ARCH"
     else
@@ -995,19 +1145,7 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
     other_note=''
     [[ "$other_count" -eq 0 ]] || other_note=", ${other_count} other"
 
-    [[ "$first" -eq 1 ]] || {
-        SUMMARY+=' | '
-        SUMMARY_PLAIN+=' | '
-    }
-
-    SUMMARY+=$(printf '%s (%s%s%s/%s%s%s%s%s)' \
-        "$name" "$GREEN" "$active_count" "$RESET" \
-        "$RED" "$commented_count" "$RESET" "$other_note" "$skip_note")
-
-    SUMMARY_PLAIN+=$(printf '%s (%s/%s%s%s)' \
-        "$name" "$active_count" "$commented_count" "$other_note" "$skip_note_plain")
-
-    first=0
+    add_summary "$name" "$active_count" "$commented_count" "$other_note" "$skip_note" "$skip_note_plain"
 done
 
 print_summary() {
@@ -1040,10 +1178,44 @@ report_skipped() {
     fi
 }
 
+# One warning and one notification for the lists whose API was unavailable (they were left
+# unchanged, the other lists were checked). Says which API failed and why.
+report_unavailable() {
+    local errors='' lists='' e l hint
+
+    [[ "$unavailable_count" -gt 0 ]] || return 0
+
+    for e in "${API_ERRORS[@]}"; do errors+="${errors:+; }$e"; done
+    for l in "${UNAVAILABLE[@]}"; do lists+="${lists:+, }$l"; done
+
+    hint=$(deny_hint api)
+    printf '%sWARNING:%s mirror status unavailable: %s\n' "$WARNING_STYLE" "$RESET" "$errors" >&2
+    printf 'hm: left unchanged: %s\n' "$lists" >&2
+    [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
+    desktop_notify 'hm: mirror status unavailable' \
+        "${errors}. Left unchanged: ${lists}. The other lists were checked.${hint:+ $hint}"
+}
+
+evaluated_count=$(( ${#MIRRORLISTS[@]} - unmanaged_count - unavailable_count ))
+
+# Only lists without an API: nothing to check.
+if [[ "$evaluated_count" -eq 0 && "$unavailable_count" -eq 0 ]]; then
+    print_summary
+    exit 0
+fi
+
+# No list could be checked at all (every API that is needed failed): nothing was changed.
+if [[ "$evaluated_count" -eq 0 ]]; then
+    errors=''
+    for e in "${API_ERRORS[@]}"; do errors+="${errors:+; }$e"; done
+    die_api "cannot get the mirror status: $errors"
+fi
+
 # Nothing can be updated although the API works (no healthy mirror anywhere): exit status 1.
-if [[ "$skipped_count" -eq "${#MIRRORLISTS[@]}" ]]; then
+if [[ "$skipped_count" -eq "$evaluated_count" ]]; then
     print_summary
     report_skipped all
+    report_unavailable
     exit 1
 fi
 
@@ -1055,13 +1227,22 @@ fi
 
 print_summary
 
-# Some lists were skipped, the others are done: warn and exit with status 2, so that callers
-# (the "up" function, hm-daemon) can tell this apart from a complete success (0), from
-# a failure (1) and from an unavailable mirror status (3). This also applies to --dry-run,
-# so that a preview agrees with a real run.
+# Some lists were skipped (a verdict about the mirrors), the others are done: warn and exit
+# with status 2, so that callers (the "up" function, hm-daemon) can tell this apart from a
+# complete success (0), from a failure (1) and from an unavailable mirror status (3). If an
+# API was unavailable as well, that is reported too, but status 2 takes precedence. This
+# also applies to --dry-run, so that a preview agrees with a real run.
 if [[ "$skipped_count" -gt 0 ]]; then
     report_skipped partial
+    report_unavailable
     exit 2
+fi
+
+# Everything that could be checked was done; the lists of an unavailable API stayed as they
+# were: status 3 (the same class as "API down", so the daemon treats it the same way).
+if [[ "$unavailable_count" -gt 0 ]]; then
+    report_unavailable
+    exit 3
 fi
 
 exit 0
