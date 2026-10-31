@@ -294,7 +294,8 @@ def pacman_flags(opts):
 
 
 def sync_ops(opts):
-    """True if the options contain an operation that downloads from mirrors: sync (-S / --sync, except the read-only queries -Ss -Si -Sl -Sg -Sc without -y/-u),
+    """True if the options contain an operation that downloads from mirrors:
+    sync (-S / --sync, except the read-only queries -Ss -Si -Sl -Sg -Sc without -y/-u),
     upgrade (-U / --upgrade) or a file-database refresh (-F with -y / --refresh, in any combination)."""
     flags = pacman_flags(opts)
     if "U" in flags or {"F", "y"} <= flags:

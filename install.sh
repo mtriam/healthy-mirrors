@@ -81,7 +81,7 @@ mv -f -- "$INSTALL_PATH.new" "$INSTALL_PATH" || die "cannot replace $INSTALL_PAT
 cmp -s -- "$STAGE/hm" "$INSTALL_PATH" || die "$INSTALL_PATH differs from the validated copy"
 
 missing=()
-for cmd in curl jq awk sed grep cmp mktemp; do
+for cmd in curl jq awk sed grep cmp find mktemp mv cp timeout; do
     command -v "$cmd" >/dev/null 2>&1 || missing+=("$cmd")
 done
 if (( ${#missing[@]} > 0 )); then warn "missing required tools: ${missing[*]}"; fi
