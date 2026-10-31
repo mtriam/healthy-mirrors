@@ -526,7 +526,7 @@ Part 1 replaces `curl` with a stub that serves canned data; part 2 downloads the
 | 5 | Both CachyOS addresses and the Arch Linux API unusable: no list can be checked, exit status 3 (mirror status unavailable), `cannot get the mirror status:` with every API named (`CachyOS:`, `Arch Linux:`) and both CachyOS addresses, no claim that a fallback is used |
 | 6 | The Arch Linux API has no fallback: its failure makes the Arch list `ERR` (exit status 3) |
 | 7 | (live) The two real APIs give the same result: the same known mirrors and the same healthy mirrors per architecture (`x86_64`, `x86_64_v3`, `x86_64_v4`), and `hm` decides the same for the mirrorlists of this system. Skipped with `--offline` or without network |
-| 8 | (live) Response time: each real API is downloaded 20 times (after a warm-up request, alternating which goes first). It passes if every download got HTTP 200; the median and fastest times are printed as notes. Skipped with `--offline` or without network |
+| 8 | (live) Response time: each real API is downloaded 3 times (after a warm-up request, alternating which goes first). It passes if every download got HTTP 200; the median and fastest times are printed as notes. Skipped with `--offline` or without network |
 | 9 | The Arch Linux API is down, the CachyOS API works: the CachyOS lists are evaluated normally, the Arch list is left unchanged and marked `ERR`, the warning names the Arch Linux API and the reason, exit status 3 |
 | 10 | Both CachyOS addresses are down, the Arch Linux API works: the Arch list is evaluated normally, the CachyOS lists are left unchanged and marked `ERR`, the warning names CachyOS and both addresses, exit status 3 |
 

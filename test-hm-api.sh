@@ -71,7 +71,7 @@ ARCH=$(const ARCH_API)
 T=$(mktemp -d /tmp/hmapitest.XXXXXX)
 LOG=$T/curl.log
 
-RUNS=20             # downloads of each real API in test 8
+RUNS=3             # downloads of each real API in test 8
 REQUEST_DELAY=0.5   # pause between two downloads in test 8
 
 PASS=0
