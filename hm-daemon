@@ -267,7 +267,12 @@ def is_client(comm):
 
 
 # Long names of the pacman options that matter here, mapped to their short form
-LONG_TO_SHORT = {"sync": "S", "upgrade": "U", "files": "F", "refresh": "y"}
+LONG_TO_SHORT = {"sync": "S", "upgrade": "U", "files": "F", "refresh": "y", "sysupgrade": "u",
+                 "search": "s", "info": "i", "list": "l", "groups": "g", "clean": "c"}
+# -S with only these query/cleanup suboptions reads local data and never contacts a mirror
+# (unless -y or -u is given as well)
+SYNC_READONLY = frozenset("siglc")
+SYNC_REFRESH = frozenset("yu")
 # Short options that take a value: the rest of a cluster such as "-b/some/path" belongs to the value
 SHORT_WITH_VALUE = "br"
 
@@ -289,10 +294,12 @@ def pacman_flags(opts):
 
 
 def sync_ops(opts):
-    """True if the options contain an operation that downloads from mirrors: sync (-S / --sync),
+    """True if the options contain an operation that downloads from mirrors: sync (-S / --sync, except the read-only queries -Ss -Si -Sl -Sg -Sc without -y/-u),
     upgrade (-U / --upgrade) or a file-database refresh (-F with -y / --refresh, in any combination)."""
     flags = pacman_flags(opts)
-    return bool(flags & {"S", "U"}) or {"F", "y"} <= flags
+    if "U" in flags or {"F", "y"} <= flags:
+        return True
+    return "S" in flags and bool(flags & SYNC_REFRESH or not flags & SYNC_READONLY)
 
 
 def should_trigger(comm, args):

@@ -118,7 +118,7 @@ list_kind() {
     base="${base%-mirrorlist}"
     [[ "$base" == mirrorlist ]] && base=arch
 
-    if [[ "${1,,}" == *cachyos* ]]; then
+    if [[ "${base,,}" == *cachyos* ]]; then
         echo cachyos
     elif [[ "$base" == arch || "$base" == archlinux ]]; then
         echo arch

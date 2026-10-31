@@ -277,7 +277,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 ### What triggers `hm`
 
-- `pacman` with a mirror-using operation: sync (`-S*` / `--sync`), upgrade (`-U` / `--upgrade`) or a file-database refresh (`-F` together with `-y`, however spelled: `-Fy`, `-F -y`, `--files --refresh`, `--files -y`). Short options and the exact long names are recognized, also when a wrapper passes them separately or mixed; abbreviated long options (such as `--syn`) are not. Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
+- `pacman` with a mirror-using operation: sync (`-S` / `--sync`; the read-only queries `-Ss`, `-Si`, `-Sl`, `-Sg`, `-Sc` do not trigger it unless `-y` or `-u` is given too), upgrade (`-U` / `--upgrade`) or a file-database refresh (`-F` together with `-y`, however spelled: `-Fy`, `-F -y`, `--files --refresh`, `--files -y`). Short options and the exact long names are recognized, also when a wrapper passes them separately or mixed; abbreviated long options (such as `--syn`) are not. Other operations, such as `pacman -Q`, `-T` or `--database`, do not trigger it.
 - Processes whose name matches `SHELLY_RE` (default: `shelly.*`).
 - AUR helpers matching `HELPERS_RE` (default: `yay|paru|pikaur|trizen|octopi`), only when started without options or with a sync/upgrade operation (recognized the same way as for `pacman`).
 
@@ -483,7 +483,7 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 6 | `hm` exceeds `HM_TIMEOUT` and has a child in another session: both are killed and the request is released |
 | 7 | Invalid configuration (`MAX_HELD=0`, `HM_TIMEOUT=nan`, `DENY_ON=abc`): the daemon exits with status 1 and names the variable |
 | 8 | A symlinked watch path with `RECHECK=0` produces a warning that replacement will not be detected |
-| 9 | Classification of 30 command lines: short and long `pacman` options (including `-F -y`, `--files -y`, `-b/path`), AUR helpers, `shelly`, other programs |
+| 9 | Classification of 39 command lines: short and long `pacman` options (including `-F -y`, `--files -y`, `-b/path`), AUR helpers, `shelly`, other programs |
 | 10 | The log names every process that opens the file, but shows command lines only for `pacman`, AUR helpers and `shelly` |
 | 11 | Cooldown: a fresh daemon starts `hm` for the first request, a second request within the cooldown does not start it again |
 | 12 | `hm` exits with an error (`1`): the request is released and the failure is logged at error priority |
@@ -545,7 +545,7 @@ hm --dry-run; echo "exit=$?"     # what a run would change, nothing is written; 
 hm --notify-test                  # notification path of a regular user
 sudo hm; echo "exit=$?"           # real run; then: grep -c '^#UH#' /etc/pacman.d/*mirrorlist*
 sudo hm --clean                   # removes the markers again
-journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Ss foo`
+journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Sp firefox`
 ```
 
 To try the blocking mode by hand (it is on by default), make `hm` report a bad result, for example by choosing `DENY_ON=partial` and going offline (exit `3`, blocked only in the strict modes), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass. In the default mode going offline only produces the warning `hm could not get the mirror status (exit code 3)` and the program continues.

@@ -811,7 +811,7 @@ validate_urls() {
 
 # Which mirrorlists belong to the CachyOS API (their name contains "cachyos"); all others
 # belong to the Arch Linux API.
-is_cachyos_list() { [[ "${1,,}" == *cachyos* ]]; }
+is_cachyos_list() { local base=${1##*/}; [[ "${base,,}" == *cachyos* ]]; }
 
 # Kind of a managed list: cachyos, arch, or other (other = no API, never touched)
 list_kind() {
@@ -819,7 +819,7 @@ list_kind() {
     base=$(basename -- "$1")
     base="${base%-mirrorlist}"
     [[ "$base" == mirrorlist ]] && base=arch
-    if [[ "${1,,}" == *cachyos* ]]; then
+    if [[ "${base,,}" == *cachyos* ]]; then
         echo cachyos
     elif [[ "$base" == arch || "$base" == archlinux ]]; then
         echo arch
@@ -1061,9 +1061,9 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
         known="$KNOWN_ARCH"
     else
         known="$KNOWN_CACHYOS"
-        if [[ "${mirrorlist,,}" == *v4* ]]; then
+        if [[ "${name,,}" == *v4* ]]; then
             healthy="$TMP_V4"
-        elif [[ "${mirrorlist,,}" == *v3* ]]; then
+        elif [[ "${name,,}" == *v3* ]]; then
             healthy="$TMP_V3"
         else
             healthy="$TMP"
