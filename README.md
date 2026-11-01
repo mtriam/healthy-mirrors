@@ -552,6 +552,8 @@ Part 1 replaces `curl` with a stub that serves canned data; part 2 downloads the
 | 10 | Both CachyOS addresses are down, the Arch Linux API works: the Arch list is evaluated normally, the CachyOS lists are left unchanged and marked `ERR`, the warning names CachyOS and both addresses, exit status 3 |
 | 11 | Lists without an API (for example `chaotic-mirrorlist`) are never touched and never marked `ERR`, whichever API is down |
 | 12 | An API that no managed list uses is not downloaded, and its outage does not matter (skipped on systems that have both CachyOS and Arch Linux lists) |
+| 13 | One malformed CachyOS entry (a `url` without `checks`) among valid ones: it is reported, and its mirror is not treated as known, so it stays active and its list is not skipped |
+| 14 | The same for the Arch Linux API (an entry without `protocol`) |
 
 Test 7 prints a `NOTE` line on whether the two responses are also identical byte for byte after key normalization (`jq -S`); a difference in fields that `hm` does not use is not a failure. The two real APIs are downloaded seconds apart, so if test 7 fails, run it again before investigating. The jq filters in the test's `derive` function copy those in `hm`; if you change the health rules in `hm`, change them there as well.
 

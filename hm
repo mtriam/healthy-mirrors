@@ -884,7 +884,7 @@ load_cachyos() {
     # known (local cache, own server, company mirror, ...) is never touched.
     jq -r '
         .mirrors[]
-        | select(.url | type == "string")
+        | select((.url | type == "string") and (.checks | type == "array"))
         | .url
         | sub("/+$"; "")
         | select(test("^[^[:cntrl:]]+$"))
@@ -950,7 +950,7 @@ load_arch() {
 
     jq -r '
         .urls[]
-        | select(.url | type == "string")
+        | select((.url | type == "string") and (.protocol | type == "string"))
         | .url
         | sub("/+$"; "")
         | select(test("^[^[:cntrl:]]+$"))

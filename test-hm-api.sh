@@ -773,6 +773,91 @@ else
         || bad "exit status 3 although only the unused API failed: $ERR"
 fi
 
+
+# pick_server KIND: the first https server of a list of that kind.
+# Sets PICK_PATH, PICK_NAME and PICK_URL; returns 1 if there is none.
+pick_server() {
+    local i line
+
+    PICK_PATH=''
+    PICK_NAME=''
+    PICK_URL=''
+
+    for i in "${!LIST_PATH[@]}"; do
+        [[ ${LIST_KIND[$i]} == "$1" ]] || continue
+        line=$(grep -m1 -E '^(#UH#)?Server = https://' "${LIST_PATH[$i]}" || true)
+        [[ -n $line ]] || continue
+        line=${line#'#UH#'}
+        PICK_PATH=${LIST_PATH[$i]}
+        PICK_NAME=${LIST_NAME[$i]}
+        PICK_URL=${line#Server = }
+        return 0
+    done
+
+    return 1
+}
+
+echo "== 13. one malformed CachyOS entry among valid ones: its mirror does not become 'known'"
+
+if (( ! HAS_CACHYOS )); then
+    skip "no CachyOS mirrorlist on this system"
+elif ! pick_server cachyos; then
+    skip "no https server in a CachyOS mirrorlist"
+else
+    # 4 entries: 3 usable, and one with a url (a real server of this system) but no checks
+    jq --arg u "$PICK_URL" '
+        .mirrors += [ (.mirrors[0] | .url = "https://good2.example.org/cachyos/"), { url: $u } ]
+    ' "$T/cachyos.json" > "$T/cachyos-one-bad.json"
+
+    run_hm "$T/cachyos-one-bad.json" fail
+
+    has "$ERR" 'ignored 1 of 4 malformed entries in the CachyOS API' \
+        && ok "the malformed entry is reported" \
+        || bad "unexpected message: $ERR"
+
+    has "$OUT" "(not known to the API): $PICK_PATH: $PICK_URL" \
+        && ok "its mirror is left as it is (not known to the API)" \
+        || bad "its mirror is treated as known: $PICK_URL"
+
+    entry=$(summary_entry "$PICK_NAME")
+    if [[ $entry != *skipped* && $RC -eq 0 ]]; then
+        ok "the list is not skipped (exit status 0)"
+    else
+        bad "list '$entry', exit status $RC"
+    fi
+fi
+
+echo "== 14. one malformed Arch Linux entry (no protocol) among valid ones: its mirror does not become 'known'"
+
+if (( ! HAS_ARCH )); then
+    skip "no Arch Linux mirrorlist on this system"
+elif ! pick_server arch; then
+    skip "no https server in the Arch Linux mirrorlist"
+else
+    jq --arg u "$PICK_URL" '
+        .urls += [ (.urls[0] | .url = "https://arch2.example.org/archlinux/"),
+                   (.urls[0] | .url = "https://arch3.example.org/archlinux/"),
+                   { url: $u } ]
+    ' "$T/arch.json" > "$T/arch-one-bad.json"
+
+    run_hm "$T/cachyos.json" fail "$T/arch-one-bad.json"
+
+    has "$ERR" 'ignored 1 of 4 malformed entries in the Arch Linux API' \
+        && ok "the malformed entry is reported" \
+        || bad "unexpected message: $ERR"
+
+    has "$OUT" "(not known to the API): $PICK_PATH: $PICK_URL" \
+        && ok "its mirror is left as it is (not known to the API)" \
+        || bad "its mirror is treated as known: $PICK_URL"
+
+    entry=$(summary_entry "$PICK_NAME")
+    if [[ $entry != *skipped* && $RC -eq 0 ]]; then
+        ok "the list is not skipped (exit status 0)"
+    else
+        bad "list '$entry', exit status $RC"
+    fi
+fi
+
 echo
 echo "passed: $PASS, failed: $FAIL, skipped: $SKIP"
 
