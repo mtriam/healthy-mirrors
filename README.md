@@ -157,7 +157,7 @@ The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daem
 
 ```bash
 cd healthy-mirrors
-git pull --ff-only
+git pull --ff-only    # updates PKGBUILD and healthy-mirrors.install (makepkg itself fetches the program sources)
 makepkg -si           # rebuilds and reinstalls the package; a running daemon is refreshed and restarted
 ```
 
