@@ -127,7 +127,7 @@ Desktop notifications on errors (optional): `notify-send` (`libnotify`), `setpri
 
 ### Package (Arch Linux / CachyOS)
 
-The repository contains a `PKGBUILD` that builds from the tagged release tarball:
+The repository contains a `PKGBUILD` for the package `healthy-mirrors-git`, which is built from the latest commit (the version is `r<number of commits>.<short hash>`; there are no release tags):
 
 ```bash
 git clone https://github.com/mtriam/healthy-mirrors.git
@@ -136,7 +136,7 @@ makepkg -si
 sudo hm-setup          # optional: configure and start hm-daemon
 ```
 
-The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daemon.service` to `/usr/lib/systemd/system`. Nothing is enabled automatically. On upgrade the sandbox paths are regenerated and a running daemon is restarted; on removal the service is stopped and the `#UH#` markers are removed.
+The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daemon.service` to `/usr/lib/systemd/system`. Nothing is enabled automatically. The package `provides` and `conflicts` with `healthy-mirrors`. On upgrade the sandbox paths are regenerated and a running daemon is restarted; on removal the service is stopped and the `#UH#` markers are removed.
 
 ### From a git checkout
 
@@ -173,7 +173,8 @@ git pull --ff-only
 ./install.sh          # updates the files; a running daemon is refreshed and restarted
 ```
 
-- With the package, update it like any other package.
+- With the package, update from the checkout: `git pull --ff-only && makepkg -si`. The version changes with every new commit.
+- **Coming from the old `install-daemon.sh`:** it generated `/etc/systemd/system/hm-daemon.service`, which overrides the unit of the package and points to `/usr/local/bin`. Remove it once and set the daemon up again: `sudo rm /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon && sudo hm-setup`.
 - `install.sh` installs files as `root:root` with mode `0755` and can be run repeatedly.
 - **Installation changed in this version:** `install-daemon.sh` is gone. `install.sh` installs `hm`, `hm-daemon`, `hm-setup` and the unit, and `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`). The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`. After updating from an older version run `hm-setup --refresh` once (`install.sh` does it when the service is running).
 - `hm-setup --refresh` regenerates the sandbox paths (from the directories of the mirrorlists reported by `hm --list`) and restarts a running service. If the service does not start, the previous drop-ins and service state are restored.
@@ -183,7 +184,7 @@ git pull --ff-only
 
 ## Uninstall
 
-Package: `sudo pacman -Rns healthy-mirrors` (stops the service and removes the `#UH#` markers first).
+Package: `sudo pacman -Rns healthy-mirrors-git` (stops the service and removes the `#UH#` markers first).
 
 Git checkout:
 
