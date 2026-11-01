@@ -39,4 +39,5 @@ package() {
     install -Dm755 hm-setup  "$pkgdir/usr/bin/hm-setup"
     install -Dm644 hm-daemon.service "$pkgdir/usr/lib/systemd/system/hm-daemon.service"
     install -Dm644 README.md "$pkgdir/usr/share/doc/$_pkgname/README.md"
+    install -Dm644 LICENSE "$pkgdir/usr/share/licenses/$pkgname/LICENSE"
 }
