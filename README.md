@@ -7,14 +7,15 @@ Checks mirror health and automatically keeps only healthy mirrors active, reduci
 Install `hm` and enable automatic mirror checks:
 
 ```bash
-git clone https://github.com/mtriam/healthy-mirrors.git && cd healthy-mirrors && makepkg -si && sudo hm-setup --defaults
+git clone https://github.com/mtriam/healthy-mirrors.git && \
+cd healthy-mirrors && makepkg -si && sudo hm-setup --defaults
 ```
 
 That's it! `makepkg -si` builds and installs the package and `hm-setup --defaults` enables and starts `hm-daemon` with the default settings (no questions asked). The daemon automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades. The build needs `git` and `base-devel`. To choose the daemon options yourself, run `sudo hm-setup` without `--defaults` (see [hm-setup](#hm-setup)).
 
 No aliases or wrappers are needed.
 
-**By default the daemon is strict about mirrors** (`DENY_ON=mirrors-partial`): if the API works but a list has no healthy mirror, or `hm` has to skip a list, the program that triggered the check (`pacman -Syu`, `yay`, ...) is blocked instead of running with outdated lists. If the mirror status of an API cannot be obtained (an API is down or unusable), you only get a warning, the lists of the other API are still checked and updated, and the program continues. Starting a blocked program again within 60 seconds lets it through. See [Blocking mode](#blocking-mode-deny_on) to make this stricter, more relaxed, or to turn it off.
+**By default the daemon is strict about mirrors** (`DENY_ON=mirrors-partial`): if the API works but a list has no healthy mirror, or `hm` has to skip a list, the program that triggered the check (`pacman -Syu`, `yay`, ...) is blocked instead of running with outdated lists. If the mirror status of an API cannot be obtained (an API is down or unusable), you only get a warning, the lists of the other API are still checked and updated, and the program continues. **Starting a blocked program again within 60 seconds lets it through.** See [Blocking mode](#blocking-mode-deny_on) to make this stricter, more relaxed, or to turn it off.
 
 Example output of hm:  
 ![Example output of hm](docs/output.png)
@@ -53,9 +54,9 @@ Every download is limited to 10 seconds, so on a very slow network one `hm` run 
 
 ### Health rules
 
-For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if all reported checks for that architecture are synchronized.
+For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if **all reported checks for that architecture are synchronized**.
 
-For Arch Linux mirrors, it keeps only active HTTPS mirrors that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour.
+For Arch Linux mirrors, it keeps only active HTTPS mirrors **that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour**.
 
 The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
 
@@ -162,12 +163,25 @@ makepkg -si           # rebuilds and reinstalls the package; a running daemon is
 ```
 
 - The version changes with every new commit.
-- **Coming from `install.sh` or the old `install-daemon.sh`** (files in `/usr/local/bin`): `/usr/local/bin` comes before `/usr/bin` in `PATH`, and `/etc/systemd/system/hm-daemon.service` overrides the unit of the package. Remove them once, then install the package and set the daemon up again: `sudo systemctl disable --now hm-daemon.service; sudo rm -f /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon /usr/local/bin/hm-setup; sudo systemctl daemon-reload; makepkg -si && sudo hm-setup --defaults`.
+- **Coming from `install.sh` or the old `install-daemon.sh`** (files in `/usr/local/bin`): `/usr/local/bin` comes before `/usr/bin` in `PATH`, and `/etc/systemd/system/hm-daemon.service` overrides the unit of the package. **Before the first `makepkg -si`**, remove the old files once:
+
+  ````bash
+  sudo systemctl disable --now hm-daemon.service
+  sudo rm -f /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon /usr/local/bin/hm-setup
+  sudo systemctl daemon-reload
+  hash -r
+  ````
+
+  Then install the package and set the daemon up again:
+
+  ````bash
+  makepkg -si && sudo hm-setup --defaults
+  ```
 - **Installation changed in this version:** the only supported installation is the package (`makepkg -si`); `install-daemon.sh` and `install.sh` are gone. `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`), and `hm-setup --defaults` does it without questions. The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`, which the package refreshes on every upgrade (`hm-setup --refresh`).
 - `hm-setup --refresh` regenerates the sandbox paths (from the directories of the mirrorlists reported by `hm --list`) and restarts a running service. If the service does not start, the previous drop-ins and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists. This also holds when `hm` itself is terminated by the same stop.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `hm-setup`, are kept.
-- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default: a check that ends with no healthy mirror (exit `1`) or with some skipped list (exit `2`) stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this. (4) The default `HM_TIMEOUT` is now `45` seconds (was `30`), because one `hm` run can take up to about 30 seconds on a very slow network. A value set with `hm-setup` or a drop-in is kept. (5) A stop of the service never blocks a held program, also when `hm` is terminated by the same stop (it is logged as `hm was terminated`). (6) `hm` now exits with the new status `3` when the mirror status cannot be obtained (an API is down, unusable or unparsable); before, this was status `1`. Anything that calls `hm` and tests for exactly `1` should be adjusted; `hm && ...` and the `up` function are not affected. (7) `DENY_ON` has two new values, `mirrors` and `mirrors-partial`, and **the default is now `mirrors-partial`**: an API outage (exit `3`) no longer blocks programs, it only produces a warning, a desktop notification and a journal entry. A `hm` timeout or an `hm` that cannot be started does not block either in these modes. The previous default `partial` and the value `failure` keep their meaning, including blocking on an API outage; to get the old behavior run `sudo hm-setup` and choose `partial` (a drop-in that already sets `DENY_ON` is kept as it is). (8) The CachyOS and Arch Linux APIs are now handled independently: an outage of one no longer prevents the lists of the other from being checked and updated. The lists of the unavailable API are left unchanged and marked `ERR` in the summary, and `hm` exits with status `3` also when only one API was unavailable (before, nothing was changed in that case). Only `hm` changes; the daemon and the installers need no update for this. (9) Mirrorlists that have no mirror status API (for example `chaotic-mirrorlist`) are no longer tied to the Arch Linux API: they are never changed, never marked `ERR`, and the summary shows only their number of active mirrors (`chaotic (6)`). Markers `#UH#` left in such a list by earlier versions are not removed automatically; run `hm --clean` once.
+- **Current behavior:** see [Exit status](#exit-status) for the exit statuses of `hm` (anything other than `0` means the lists are not fully up to date), [Blocking mode](#blocking-mode-deny_on) for what the daemon does with each of them, and the table in [Configuration](#configuration) for the defaults. A value set with `hm-setup` or a drop-in is kept on update.
 
 ## Uninstall
 
