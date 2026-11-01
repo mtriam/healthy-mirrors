@@ -1,7 +1,7 @@
 #!/usr/bin/env bash
 # hm-setup - configure and start (or remove) the hm-daemon systemd service
 #
-# The service unit itself (hm-daemon.service) is installed by the package or by install.sh.
+# The service unit itself (hm-daemon.service) is installed by the package.
 # This script does the part that depends on the system:
 #   - asks "hm --list" which mirrorlists exist and writes the matching sandbox paths
 #     into a drop-in (10-hm-paths.conf),
@@ -63,7 +63,7 @@ fi
 
 # ----------------------------------------------------------------------------- checks
 systemctl cat "$SVC" >/dev/null 2>&1 ||
-    die "$SVC is not installed (install the package, or run install.sh from the repository)"
+    die "$SVC is not installed (install the package: makepkg -si)"
 
 # hm and the daemon as the unit sees them (the unit sets HM=..., a drop-in may override it)
 HM=/usr/bin/hm

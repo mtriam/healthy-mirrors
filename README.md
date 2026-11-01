@@ -7,11 +7,10 @@ Checks mirror health and automatically keeps only healthy mirrors active, reduci
 Install `hm` and enable automatic mirror checks:
 
 ```bash
-git clone https://github.com/mtriam/healthy-mirrors.git
-cd healthy-mirrors && ./install.sh && hm-setup
+git clone https://github.com/mtriam/healthy-mirrors.git && cd healthy-mirrors && makepkg -si && sudo hm-setup --defaults
 ```
 
-That's it! `hm-setup` asks for the daemon options (Enter keeps the defaults), then enables and starts `hm-daemon`, which automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades. On Arch Linux / CachyOS you can use the [package](#install) instead of `install.sh`.
+That's it! `makepkg -si` builds and installs the package and `hm-setup --defaults` enables and starts `hm-daemon` with the default settings (no questions asked). The daemon automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades. The build needs `git` and `base-devel`. To choose the daemon options yourself, run `sudo hm-setup` without `--defaults` (see [hm-setup](#hm-setup)).
 
 No aliases or wrappers are needed.
 
@@ -121,7 +120,7 @@ All dependencies are already satisfied on a default CachyOS installation.
 
 Desktop notifications on errors (optional): `notify-send` (`libnotify`), `setpriv` and `loginctl` (`util-linux`, `systemd`), and a running notification daemon in your session.
 
-`install.sh` and `hm-setup` additionally use `install`, `stat`, `readlink` (coreutils) and `systemctl`; `pacman-conf` and `systemd-analyze` are used when available.
+`hm-setup` additionally uses `install`, `stat`, `readlink` (coreutils) and `systemctl`; `pacman-conf` and `systemd-analyze` are used when available.
 
 ## Install
 
@@ -133,21 +132,10 @@ The repository contains a `PKGBUILD` for the package `healthy-mirrors-git`, whic
 git clone https://github.com/mtriam/healthy-mirrors.git
 cd healthy-mirrors
 makepkg -si
-sudo hm-setup          # optional: configure and start hm-daemon
+sudo hm-setup --defaults   # start hm-daemon with the default settings (or: sudo hm-setup, to choose the options)
 ```
 
 The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daemon.service` to `/usr/lib/systemd/system`. Nothing is enabled automatically. The package `provides` and `conflicts` with `healthy-mirrors`. On upgrade the sandbox paths are regenerated and a running daemon is restarted; on removal the service is stopped and the `#UH#` markers are removed.
-
-### From a git checkout
-
-```bash
-git clone https://github.com/mtriam/healthy-mirrors.git
-cd healthy-mirrors
-./install.sh           # installs hm, hm-daemon, hm-setup to /usr/local/bin and the unit to /etc/systemd/system
-hm-setup               # optional: configure and start hm-daemon
-```
-
-`install.sh` uses only files from the local checkout; it never downloads anything. Because the installed files run as root, it refuses a source file that is not owned by root or by the user who ran `sudo`, or that is world-writable (group-writable only produces a warning), copies the files into a root-only staging directory under `/run`, validates those exact copies, installs them atomically and verifies the result. Use `SRC_DIR=/path/to/checkout ./install.sh` to install from another local path. Use either the package or `install.sh`, not both.
 
 ### hm-setup
 
@@ -161,7 +149,7 @@ hm-setup               # optional: configure and start hm-daemon
 | Command | Meaning |
 |---|---|
 | `hm-setup` | interactive: choose the options, then enable and start the service |
-| `hm-setup --defaults` | no questions: keep the current values, enable and start |
+| `hm-setup --defaults` (or `-y`) | no questions: keep the current values (the built-in defaults on a first run), enable and start; this is what the [Quick start](#quick-start) uses |
 | `hm-setup --refresh` | regenerate the sandbox paths and restart a running service (also after a change of `Include` lines in `pacman.conf`) |
 | `hm-setup --remove` | stop and disable the service, remove the generated sandbox drop-in (settings are kept) |
 
@@ -170,13 +158,12 @@ hm-setup               # optional: configure and start hm-daemon
 ```bash
 cd healthy-mirrors
 git pull --ff-only
-./install.sh          # updates the files; a running daemon is refreshed and restarted
+makepkg -si           # rebuilds and reinstalls the package; a running daemon is refreshed and restarted
 ```
 
-- With the package, update from the checkout: `git pull --ff-only && makepkg -si`. The version changes with every new commit.
-- **Coming from the old `install-daemon.sh`:** it generated `/etc/systemd/system/hm-daemon.service`, which overrides the unit of the package and points to `/usr/local/bin`. Remove it once and set the daemon up again: `sudo rm /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon && sudo hm-setup`.
-- `install.sh` installs files as `root:root` with mode `0755` and can be run repeatedly.
-- **Installation changed in this version:** `install-daemon.sh` is gone. `install.sh` installs `hm`, `hm-daemon`, `hm-setup` and the unit, and `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`). The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`. After updating from an older version run `hm-setup --refresh` once (`install.sh` does it when the service is running).
+- The version changes with every new commit.
+- **Coming from `install.sh` or the old `install-daemon.sh`** (files in `/usr/local/bin`): `/usr/local/bin` comes before `/usr/bin` in `PATH`, and `/etc/systemd/system/hm-daemon.service` overrides the unit of the package. Remove them once, then install the package and set the daemon up again: `sudo systemctl disable --now hm-daemon.service; sudo rm -f /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon /usr/local/bin/hm-setup; sudo systemctl daemon-reload; makepkg -si && sudo hm-setup --defaults`.
+- **Installation changed in this version:** the only supported installation is the package (`makepkg -si`); `install-daemon.sh` and `install.sh` are gone. `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`), and `hm-setup --defaults` does it without questions. The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`, which the package refreshes on every upgrade (`hm-setup --refresh`).
 - `hm-setup --refresh` regenerates the sandbox paths (from the directories of the mirrorlists reported by `hm --list`) and restarts a running service. If the service does not start, the previous drop-ins and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists. This also holds when `hm` itself is terminated by the same stop.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `hm-setup`, are kept.
@@ -185,12 +172,6 @@ git pull --ff-only
 ## Uninstall
 
 Package: `sudo pacman -Rns healthy-mirrors-git` (stops the service and removes the `#UH#` markers first).
-
-Git checkout:
-
-```bash
-./install.sh --uninstall   # stops the service, runs hm --clean, removes the installed files
-```
 
 Drop-ins (made with `hm-setup` or `systemctl edit`) are left in `/etc/systemd/system/hm-daemon.service.d/`, so your settings survive a later install; remove the directory manually if needed.
 
@@ -234,6 +215,15 @@ Exit status: `0`, `1`, `2` or `3`, see [Exit status](#exit-status).
 ### Shell function: `up`
 
 The `up` function refreshes the healthy mirror list with `hm` and then runs a system upgrade, optionally installing the given packages. **The upgrade is started only if `hm` exits with status `0`**: on an error (`1`), when no list could be updated (`1`), when some lists were skipped (`2`) and when the mirror status of some API could not be obtained (`3`) it is not. In the last two cases you have seen `hm`'s warning; if you accept the lists as they were, run `sudo pacman -Syu` directly.
+
+#### bash
+
+```bash
+echo 'up() { hm && sudo pacman -Syu "$@"; }' >> ~/.bashrc
+source ~/.bashrc
+```
+
+The zsh variants below use the same syntax in bash (put them in `~/.bashrc`).
 
 #### zsh
 
@@ -400,7 +390,7 @@ Environment="HELPERS_RE=yay|paru"
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HM` | `/usr/local/bin/hm` | Script to run (absolute path); the unit sets it to the installed path |
+| `HM` | `/usr/bin/hm` | Script to run (absolute path); the unit sets it to the installed path |
 | `HM_TIMEOUT` | `45` | Seconds before `hm` is killed (> 0). One run can take up to 30 s on a very slow network (three downloads, each limited to 10 s), so keep it above that |
 | `COOLDOWN` | `60` | Minimum seconds between `hm` runs (≥ 0). In blocking mode also the window in which a blocked program can be started again |
 | `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated, at least one) |
@@ -415,7 +405,7 @@ Numbers must be finite; a value that does not match its constraint makes the ser
 
 ### Security
 
-The daemon runs as root and executes `hm` as root (`/usr/bin/hm` from the package, `/usr/local/bin/hm` from `install.sh`). `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `hm-setup` checks this when it starts the service.
+The daemon runs as root and executes `hm` as root (`/usr/bin/hm` from the package). `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `hm-setup` checks this when it starts the service.
 
 The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces, no writable-and-executable memory (`MemoryDenyWriteExecute`), a `/proc` that shows only process directories (`ProcSubset=pid`) and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The unit with its drop-ins (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
 
@@ -576,7 +566,6 @@ To try the blocking mode by hand (it is on by default), make `hm` report a bad r
 | `hm-daemon` | The optional fanotify service that runs `hm` before `pacman`/`shelly` read the mirror lists |
 | `hm-daemon.service` | The hardened systemd unit of the daemon |
 | `hm-setup` | Configures (interactively), starts, refreshes or removes the service |
-| `install.sh` | Installs/uninstalls `hm`, `hm-daemon`, `hm-setup` and the unit from a git checkout |
 | `PKGBUILD`, `healthy-mirrors.install` | Arch Linux package |
 | `test-hm-daemon.sh` | Tests for the daemon |
 | `test-hm-api.sh` | Tests for the CachyOS API fallback of `hm`, the independence of the two APIs and a comparison of the two CachyOS APIs |

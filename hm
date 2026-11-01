@@ -1171,13 +1171,13 @@ report_skipped() {
 
     if [[ "$1" == all ]]; then
         hint=$(deny_hint failure)
-        printf '%sWARNING:%s no mirror list was updated: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        printf '%sWARNING:%s no mirror list was updated: %s\n' "$WARNING_STYLE" "$RESET" "$problems" >&2
         [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
         desktop_notify 'hm: no mirror list updated' \
             "No list was updated: ${problems}. Mirror summary (on/off): ${SUMMARY_PLAIN}.${hint:+ $hint}"
     else
         hint=$(deny_hint partial)
-        printf '%sWARNING:%s left unchanged: %s\n' "$WARNING_STYLE" "$RESET" "$problems"
+        printf '%sWARNING:%s left unchanged: %s\n' "$WARNING_STYLE" "$RESET" "$problems" >&2
         [[ -z "$hint" ]] || printf 'hm: %s\n' "$hint" >&2
         desktop_notify 'hm: some mirror lists not updated' \
             "Left unchanged: ${problems}. The other lists were updated. Mirror summary (on/off): ${SUMMARY_PLAIN}.${hint:+ $hint}"

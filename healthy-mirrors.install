@@ -1,5 +1,5 @@
 post_install() {
-    echo ':: healthy-mirrors: run "sudo hm-setup" to configure and start hm-daemon'
+    echo ':: healthy-mirrors: run "sudo hm-setup --defaults" to start hm-daemon with the default settings ("sudo hm-setup" lets you choose the options)'
     echo '   (optional: it runs hm automatically before pacman/shelly; without it run "hm" yourself)'
 }
 

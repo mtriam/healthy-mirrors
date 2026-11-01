@@ -151,7 +151,7 @@ def env_choice(name, default, choices):
 def load_config():
     global HM, HM_TIMEOUT, COOLDOWN, RECHECK, MAX_HELD, STOP_GRACE, WATCH, SHELLY_RE, HELPERS_RE
     global DENY_ON, DENY_SET
-    HM = os.environ.get("HM", "/usr/local/bin/hm")
+    HM = os.environ.get("HM", "/usr/bin/hm")
     if not os.path.isabs(HM):
         raise Fatal(f"invalid HM={HM!r}: must be an absolute path")
     # seconds before hm is killed; the worst case of one hm run is three downloads of 10 s each
