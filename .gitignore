@@ -4,3 +4,4 @@
 *.pkg.tar.*
 *.tar.gz
 *.log
+/healthy-mirrors/
