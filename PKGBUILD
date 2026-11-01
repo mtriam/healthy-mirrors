@@ -14,7 +14,7 @@ depends=(
 optdepends=('libnotify: desktop notifications on errors')
 install="$pkgname.install"
 source=("$pkgname-$pkgver.tar.gz::$url/archive/refs/tags/v$pkgver.tar.gz")
-sha256sums=('ae07ad043c2e44af5ca0e4b5bfdf6a5759321a5a9770737de8b48916a4661c14')
+sha256sums=('1f6457d31ebd55f0b1776e22f69d41c3f0099b57fc2c7806eb9dd64a6c292b14')
 
 check() {
     cd "$pkgname-$pkgver"
