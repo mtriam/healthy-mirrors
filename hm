@@ -307,8 +307,9 @@ allow_termination() {
 
 declare -a MIRRORLISTS=()
 declare -A SEEN_LISTS=()
+declare -A SECTIONS=()    # mirrorlist -> names of the [sections] of pacman.conf that include it
 
-while IFS= read -r include; do
+while IFS=$'\t' read -r include section; do
     [[ -n "$include" ]] || continue
 
     # pacman.conf paths are expected to be absolute in this use case.
@@ -326,6 +327,9 @@ while IFS= read -r include; do
             die "$mirrorlist is a symlink (to $(readlink -- "$mirrorlist")); symlinked mirrorlists are not supported because updating one would write through the link, outside of the transaction"
         fi
         [[ -f "$mirrorlist" ]] || continue
+        if [[ -n "$section" && "$section" != options ]]; then
+            SECTIONS[$mirrorlist]+="${SECTIONS[$mirrorlist]:+ }$section"
+        fi
         [[ -z "${SEEN_LISTS[$mirrorlist]:-}" ]] || continue
 
         SEEN_LISTS[$mirrorlist]=1
@@ -334,11 +338,19 @@ while IFS= read -r include; do
 done < <(
     awk '
         /^[[:space:]]*#/ { next }
-        /^[[:space:]]*Include[[:space:]]*=/ {
-            sub(/^[[:space:]]*Include[[:space:]]*=[[:space:]]*/, "")
-            sub(/[[:space:]]*#.*/, "")
-            sub(/[[:space:]]*$/, "")
-            if ($0 != "") print
+        {
+            line = $0
+            sub(/[[:space:]]*#.*/, "", line)
+            sub(/^[[:space:]]+/, "", line)
+            sub(/[[:space:]]+$/, "", line)
+        }
+        line ~ /^\[[^]]+\]$/ {
+            section = substr(line, 2, length(line) - 2)
+            next
+        }
+        line ~ /^Include[[:space:]]*=/ {
+            sub(/^Include[[:space:]]*=[[:space:]]*/, "", line)
+            if (line != "") printf "%s\t%s\n", line, section
         }
     ' /etc/pacman.conf
 )
@@ -695,6 +707,8 @@ new_temp || die 'cannot create temporary file'
 KNOWN_CACHYOS=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
 KNOWN_ARCH=$NEW_TEMP_PATH
+new_temp || die 'cannot create temporary file'
+KNOWN_REPOS=$NEW_TEMP_PATH
 
 # Reason why the last API response could not be used (set by check_entries,
 # fetch_cachyos_api, fetch_arch_api, load_cachyos and load_arch, which do not exit on
@@ -879,6 +893,21 @@ load_cachyos() {
         return 1
     }
 
+    # Names of the repositories the API reports: the second component of every check path
+    # ("x86_64_v4/cachyos-znver4" -> "cachyos-znver4"). They are the [section] names of
+    # pacman.conf, which is how a list is judged by the repositories it really serves.
+    jq -r '
+        [ .mirrors[]
+          | select(.checks | type == "array")
+          | .checks[]
+          | select(.path | type == "string")
+          | .path | split("/") | select(length >= 2) | .[1] ]
+        | unique | .[]
+    ' "$JSON_CACHYOS" > "$KNOWN_REPOS" || {
+        FETCH_ERROR='cannot parse CachyOS repository names'
+        return 1
+    }
+
     # CachyOS health lists. An empty list is not an error here: it only matters for a
     # mirrorlist that uses it (such a list is skipped below, the other lists are still
     # updated).
@@ -985,6 +1014,40 @@ fi
 #     alone are no replacement for them: they cannot be vouched for).
 # ---------------------------------------------------------------------------
 
+# The repositories (known to the CachyOS API) that pacman.conf takes from the mirrorlist $1,
+# space separated; empty if none of its [section] names is a repository of the API.
+list_repos() {
+    local section out=''
+
+    for section in ${SECTIONS[$1]:-}; do
+        if grep -qxF -- "$section" "$KNOWN_REPOS"; then
+            out+="${out:+ }$section"
+        fi
+    done
+
+    printf '%s' "$out"
+}
+
+# Healthy CachyOS mirrors for the repositories $1 (space separated names): all reported
+# checks of exactly these repositories must be "synced", whatever the architecture directory.
+healthy_for_repos() {
+    jq -r --arg repos "$1" '
+        ($repos | split(" ") | map(select(length > 0))) as $names
+        | .mirrors[]
+        | select((.url | type == "string") and (.checks | type == "array"))
+        | select(.url | startswith("https://"))
+        | [ .checks[]
+            | select(.path | type == "string")
+            | select((.path | split("/")) as $p
+                     | ($p | length) >= 2 and ($p[1] as $r | any($names[]; . == $r)))
+            | .status
+          ] as $checks
+        | select(($checks | length) > 0 and all($checks[]; . == "synced"))
+        | .url
+        | sub("/+$"; "")
+    ' "$JSON_CACHYOS"
+}
+
 # True if the Server value ($1) starts with one of the URLs given as the remaining arguments.
 matches_any() {
     local server="$1" url
@@ -1073,6 +1136,19 @@ for mirrorlist in "${MIRRORLISTS[@]}"; do
             healthy="$TMP_V3"
         else
             healthy="$TMP"
+        fi
+
+        # Judge the list by the repositories that pacman.conf really takes from it
+        # (e.g. only the znver4 ones, or only the v4 ones). If none of its section names
+        # is a repository of the API, the whole architecture chosen above is used.
+        repos=$(list_repos "$mirrorlist")
+        if [[ -n "$repos" ]]; then
+            new_temp || die 'cannot create temporary file'
+            healthy=$NEW_TEMP_PATH
+            healthy_for_repos "$repos" > "$healthy" ||
+                die "cannot parse the CachyOS mirror status for $name"
+            validate_urls "$healthy" ||
+                die "invalid CachyOS URL ($name)"
         fi
     fi
 
