@@ -54,7 +54,7 @@ Every download is limited to 10 seconds, so on a very slow network one `hm` run 
 
 ### Health rules
 
-For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. A mirror is considered healthy for a given architecture only if **all reported checks for that architecture are synchronized**.
+For CachyOS, it checks mirror synchronization separately for the `x86_64`, `x86_64_v3`, and `x86_64_v4` architectures. Which check applies to a list depends on its file name: a name containing `v3` uses the `x86_64_v3` check, a name containing `v4` the `x86_64_v4` check, and any other CachyOS list the `x86_64` check. The `x86_64_v4` check covers every repository the API reports under `x86_64_v4/`, including the `znver4` ones (for AMD Zen 4 CPUs), which use `cachyos-v4-mirrorlist` as well; a mirror therefore has to be in sync for all of them, even if you only use some. A mirror is considered healthy for a given architecture only if **all reported checks for that architecture are synchronized**.
 
 For Arch Linux mirrors, it keeps only active HTTPS mirrors **that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour**.
 
