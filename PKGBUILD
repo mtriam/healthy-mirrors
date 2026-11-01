@@ -2,7 +2,7 @@
 
 pkgname=healthy-mirrors-git
 _pkgname=healthy-mirrors
-pkgver=r49.1b6c3c8
+pkgver=r57.c8a0605
 pkgrel=1
 pkgdesc='Keeps only healthy mirrors active in the CachyOS/Arch Linux mirrorlists, with an optional pacman guard daemon'
 arch=('any')
@@ -28,7 +28,9 @@ pkgver() {
 check() {
     cd "$_pkgname"
     local f
-    for f in hm hm-setup; do bash -n "$f"; done
+    for f in hm hm-setup; do
+        bash -n "$f" || return 1
+    done
     python -c 'import ast, sys; ast.parse(open(sys.argv[1]).read())' hm-daemon
 }
 
