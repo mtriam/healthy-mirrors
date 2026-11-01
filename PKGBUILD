@@ -1,7 +1,7 @@
 # Maintainer: mtriam <265996944+mtriam@users.noreply.github.com>
 
 pkgname=healthy-mirrors
-pkgver=1.0.0
+pkgver=1.1.0
 pkgrel=1
 pkgdesc='Keeps only healthy mirrors active in the CachyOS/Arch Linux mirrorlists, with an optional pacman guard daemon'
 arch=('any')
