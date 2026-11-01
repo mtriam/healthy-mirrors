@@ -241,13 +241,7 @@ function up; hm; or test $status -eq 2; and sudo pacman -Syu $argv; end
 
 #### Variant: also continue when an API is unavailable
 
-To match the daemon's default mode (an API outage is only a warning), accept status `3` too:
-
-```zsh
-up() { hm || [ $? -eq 2 ] || [ $? -eq 3 ] && sudo pacman -Syu "$@"; }
-```
-
-In zsh `$?` inside `||` lists refers to the last command, so for a precise version use a small function body:
+To match the default mode of the daemon (an API outage is only a warning), accept status `3` too. `$?` is overwritten by every test, so it has to be saved in a variable first:
 
 ```zsh
 up() { hm; local rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ] || [ $rc -eq 3 ] || return $rc; sudo pacman -Syu "$@"; }

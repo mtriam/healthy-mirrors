@@ -673,6 +673,12 @@ fi
 # the mirror status of some API is missing, the exit status is 3.
 # ---------------------------------------------------------------------------
 
+# curl and jq are needed from here on; without them a missing tool would be
+# reported as an API outage instead of the real cause.
+for tool in curl jq; do
+    command -v "$tool" >/dev/null 2>&1 || die "required tool not found: $tool"
+done
+
 new_temp || die 'cannot create temporary file'
 JSON_CACHYOS=$NEW_TEMP_PATH
 new_temp || die 'cannot create temporary file'
