@@ -177,7 +177,7 @@ makepkg -si           # rebuilds and reinstalls the package; a running daemon is
   ````bash
   makepkg -si && sudo hm-setup --defaults
   ```
-- **Installation changed in this version:** the only supported installation is the package (`makepkg -si`); `install-daemon.sh` and `install.sh` are gone. `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`), and `hm-setup --defaults` does it without questions. The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`, which the package refreshes on every upgrade (`hm-setup --refresh`).
+- **Installation:** only the package (`makepkg -si`) is supported. `hm-setup` configures and starts the daemon, and the package refreshes its sandbox paths on every upgrade (`hm-setup --refresh`).
 - `hm-setup --refresh` regenerates the sandbox paths (from the directories of the mirrorlists reported by `hm --list`) and restarts a running service. If the service does not start, the previous drop-ins and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists. This also holds when `hm` itself is terminated by the same stop.
 - Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `hm-setup`, are kept.
