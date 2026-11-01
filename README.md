@@ -8,10 +8,10 @@ Install `hm` and enable automatic mirror checks:
 
 ```bash
 git clone https://github.com/mtriam/healthy-mirrors.git
-cd healthy-mirrors && ./install.sh && ./install-daemon.sh
+cd healthy-mirrors && ./install.sh && hm-setup
 ```
 
-That's it! `hm-daemon` automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades.
+That's it! `hm-setup` asks for the daemon options (Enter keeps the defaults), then enables and starts `hm-daemon`, which automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades. On Arch Linux / CachyOS you can use the [package](#install) instead of `install.sh`.
 
 No aliases or wrappers are needed.
 
@@ -93,7 +93,7 @@ Status `2` also applies to `--dry-run`, so that a preview agrees with a real run
 ## Limitations
 
 - **Symlinked mirrorlists are not supported.** `hm` stops with an error. Updating a symlink would write through it, outside of the transaction (copying a symlink over the staging file with `cp -a` turns the staging file itself into a symlink).
-- **`Include` paths containing whitespace are not supported.** They are split into words and not recognized. The installer refuses them as well.
+- **`Include` paths containing whitespace are not supported.** They are split into words and not recognized. `hm-setup` refuses them as well.
 - **A skipped or unavailable list keeps its previous state.** That state may contain `#UH#` markers from an earlier run, which can be out of date until the API data for that list is healthy again (or the API is reachable again).
 - **A set of files is not replaced atomically.** Every file is replaced atomically (and each one is valid on its own), but a program that reads the mirrorlists while `hm` runs may briefly see some lists updated and others not. When `hm` is started by `hm-daemon`, such programs are held until it finishes. After a crash or power loss, every file is either the old or the new version, and leftover `.hm-stage.*` / `.hm-backup.*` files may remain.
 - **No locking between runs.** Two `hm` runs at the same time (for example a manual `hm` while the daemon runs one) are not serialized. The result is one of the valid states, possibly built from two different API snapshots; the next run corrects it.
@@ -121,56 +121,77 @@ All dependencies are already satisfied on a default CachyOS installation.
 
 Desktop notifications on errors (optional): `notify-send` (`libnotify`), `setpriv` and `loginctl` (`util-linux`, `systemd`), and a running notification daemon in your session.
 
-The installers additionally use `install`, `stat` and `readlink` (coreutils); `pacman-conf` and `systemd-analyze` are used when available.
+`install.sh` and `hm-setup` additionally use `install`, `stat`, `readlink` (coreutils) and `systemctl`; `pacman-conf` and `systemd-analyze` are used when available.
 
 ## Install
+
+### Package (Arch Linux / CachyOS)
+
+The repository contains a `PKGBUILD` that builds from the tagged release tarball:
 
 ```bash
 git clone https://github.com/mtriam/healthy-mirrors.git
 cd healthy-mirrors
-./install.sh          # installs hm to /usr/local/bin
-./install-daemon.sh   # optional: installs and starts hm-daemon.service
+makepkg -si
+sudo hm-setup          # optional: configure and start hm-daemon
 ```
 
-Both installers use only files from the local checkout; they never download anything. Because the installed files run as root, they:
+The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daemon.service` to `/usr/lib/systemd/system`. Nothing is enabled automatically. On upgrade the sandbox paths are regenerated and a running daemon is restarted; on removal the service is stopped and the `#UH#` markers are removed.
 
-- refuse a source file that is not owned by root or by the user who ran `sudo`, or that is world-writable (group-writable only produces a warning),
-- copy the file into a root-only staging directory under `/run`, validate that exact copy, install it atomically and verify the result.
+### From a git checkout
 
-`install-daemon.sh` additionally:
+```bash
+git clone https://github.com/mtriam/healthy-mirrors.git
+cd healthy-mirrors
+./install.sh           # installs hm, hm-daemon, hm-setup to /usr/local/bin and the unit to /etc/systemd/system
+hm-setup               # optional: configure and start hm-daemon
+```
 
-- requires `hm` to be installed already (run `./install.sh` first) and checks that `hm` and every path component up to `/` are root-owned, not symlinks and not group/world-writable,
-- asks `hm --list` which mirrorlists exist, so that `hm` and the service sandbox agree on the writable directories (`hm --list` stops with an error when a mirrorlist is a symlink),
-- generates the hardened unit and **restores the previous version if the new service does not start** (it must stay up for 2 seconds without a restart).
+`install.sh` uses only files from the local checkout; it never downloads anything. Because the installed files run as root, it refuses a source file that is not owned by root or by the user who ran `sudo`, or that is world-writable (group-writable only produces a warning), copies the files into a root-only staging directory under `/run`, validates those exact copies, installs them atomically and verifies the result. Use `SRC_DIR=/path/to/checkout ./install.sh` to install from another local path. Use either the package or `install.sh`, not both.
 
-Use `SRC=/path/to/file ./install.sh` or `SRC=/path/to/hm-daemon ./install-daemon.sh` to install from another local path.
+### hm-setup
+
+`hm-setup` does the part that depends on your system:
+
+- asks `hm --list` which mirrorlists exist and writes the matching sandbox paths into a drop-in (`/etc/systemd/system/hm-daemon.service.d/10-hm-paths.conf`),
+- asks for the daemon options (see [Configuration](#configuration)) and writes the values that differ from the defaults to `hm-config.conf` in the same directory,
+- enables and starts the service. **If the service does not stay up for 2 seconds, the previous settings and state are restored.**
+- checks that `hm` and every path component up to `/` are root-owned, not symlinks and not group/world-writable.
+
+| Command | Meaning |
+|---|---|
+| `hm-setup` | interactive: choose the options, then enable and start the service |
+| `hm-setup --defaults` | no questions: keep the current values, enable and start |
+| `hm-setup --refresh` | regenerate the sandbox paths and restart a running service (also after a change of `Include` lines in `pacman.conf`) |
+| `hm-setup --remove` | stop and disable the service, remove the generated sandbox drop-in (settings are kept) |
 
 ## Update
 
 ```bash
 cd healthy-mirrors
 git pull --ff-only
-./install.sh          # updates hm in /usr/local/bin
-./install-daemon.sh   # optional: updates and restarts hm-daemon.service
+./install.sh          # updates the files; a running daemon is refreshed and restarted
 ```
 
-- `install.sh` and `install-daemon.sh` install files as `root:root` with mode `0755` and can be run repeatedly.
-- `install-daemon.sh` replaces `/usr/local/bin/hm-daemon`, regenerates the service unit (using the directories of the mirrorlists reported by `hm --list`) and restarts the service. If the new version does not start, the previous binary, unit and service state are restored.
+- With the package, update it like any other package.
+- `install.sh` installs files as `root:root` with mode `0755` and can be run repeatedly.
+- **Installation changed in this version:** `install-daemon.sh` is gone. `install.sh` installs `hm`, `hm-daemon`, `hm-setup` and the unit, and `hm-setup` configures and starts the service (it replaces `install-daemon.sh --configure`). The unit is no longer generated per system: the sandbox paths from `hm --list` go into a drop-in written by `hm-setup`. After updating from an older version run `hm-setup --refresh` once (`install.sh` does it when the service is running).
+- `hm-setup --refresh` regenerates the sandbox paths (from the directories of the mirrorlists reported by `hm --list`) and restarts a running service. If the service does not start, the previous drop-ins and service state are restored.
 - Restarting the daemon is safe: if it stops, the kernel releases all held `open()` requests, so `pacman` is never blocked. In the worst case, a `pacman` started during the restart runs with the existing mirror lists. This also holds when `hm` itself is terminated by the same stop.
-- Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `--configure`, are kept.
-- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default: a check that ends with no healthy mirror (exit `1`) or with some skipped list (exit `2`) stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this. (4) The default `HM_TIMEOUT` is now `45` seconds (was `30`), because one `hm` run can take up to about 30 seconds on a very slow network. A value set with `--configure` or a drop-in is kept. (5) A stop of the service never blocks a held program, also when `hm` is terminated by the same stop (it is logged as `hm was terminated`). (6) `hm` now exits with the new status `3` when the mirror status cannot be obtained (an API is down, unusable or unparsable); before, this was status `1`. Anything that calls `hm` and tests for exactly `1` should be adjusted; `hm && ...` and the `up` function are not affected. (7) `DENY_ON` has two new values, `mirrors` and `mirrors-partial`, and **the default is now `mirrors-partial`**: an API outage (exit `3`) no longer blocks programs, it only produces a warning, a desktop notification and a journal entry. A `hm` timeout or an `hm` that cannot be started does not block either in these modes. The previous default `partial` and the value `failure` keep their meaning, including blocking on an API outage; to get the old behavior run `./install-daemon.sh --configure` and choose `partial` (a drop-in that already sets `DENY_ON` is kept as it is). (8) The CachyOS and Arch Linux APIs are now handled independently: an outage of one no longer prevents the lists of the other from being checked and updated. The lists of the unavailable API are left unchanged and marked `ERR` in the summary, and `hm` exits with status `3` also when only one API was unavailable (before, nothing was changed in that case). Only `hm` changes; the daemon and the installers need no update for this. (9) Mirrorlists that have no mirror status API (for example `chaotic-mirrorlist`) are no longer tied to the Arch Linux API: they are never changed, never marked `ERR`, and the summary shows only their number of active mirrors (`chaotic (6)`). Markers `#UH#` left in such a list by earlier versions are not removed automatically; run `hm --clean` once.
+- Settings made with a systemd drop-in (`/etc/systemd/system/hm-daemon.service.d/`), including those made with `hm-setup`, are kept.
+- **Behavior changes in this version:** (1) `hm` now exits with status `2` (instead of `0`) when it skipped some lists; the `up` function below no longer starts the upgrade in that case. (2) The daemon now blocks by default: a check that ends with no healthy mirror (exit `1`) or with some skipped list (exit `2`) stops the triggering program with `EPERM` instead of letting it continue with outdated lists. Starting it again within `COOLDOWN` seconds lets it through. (3) `hm` now falls back to a second CachyOS API address when the primary one cannot be used and prints a warning when it does (see [Data sources and the CachyOS fallback](#data-sources-and-the-cachyos-fallback)); only `hm` changes, the daemon and the installers need no update for this. (4) The default `HM_TIMEOUT` is now `45` seconds (was `30`), because one `hm` run can take up to about 30 seconds on a very slow network. A value set with `hm-setup` or a drop-in is kept. (5) A stop of the service never blocks a held program, also when `hm` is terminated by the same stop (it is logged as `hm was terminated`). (6) `hm` now exits with the new status `3` when the mirror status cannot be obtained (an API is down, unusable or unparsable); before, this was status `1`. Anything that calls `hm` and tests for exactly `1` should be adjusted; `hm && ...` and the `up` function are not affected. (7) `DENY_ON` has two new values, `mirrors` and `mirrors-partial`, and **the default is now `mirrors-partial`**: an API outage (exit `3`) no longer blocks programs, it only produces a warning, a desktop notification and a journal entry. A `hm` timeout or an `hm` that cannot be started does not block either in these modes. The previous default `partial` and the value `failure` keep their meaning, including blocking on an API outage; to get the old behavior run `sudo hm-setup` and choose `partial` (a drop-in that already sets `DENY_ON` is kept as it is). (8) The CachyOS and Arch Linux APIs are now handled independently: an outage of one no longer prevents the lists of the other from being checked and updated. The lists of the unavailable API are left unchanged and marked `ERR` in the summary, and `hm` exits with status `3` also when only one API was unavailable (before, nothing was changed in that case). Only `hm` changes; the daemon and the installers need no update for this. (9) Mirrorlists that have no mirror status API (for example `chaotic-mirrorlist`) are no longer tied to the Arch Linux API: they are never changed, never marked `ERR`, and the summary shows only their number of active mirrors (`chaotic (6)`). Markers `#UH#` left in such a list by earlier versions are not removed automatically; run `hm --clean` once.
 
 ## Uninstall
 
-Remove the markers first, otherwise commented-out mirrors stay disabled:
+Package: `sudo pacman -Rns healthy-mirrors` (stops the service and removes the `#UH#` markers first).
+
+Git checkout:
 
 ```bash
-hm --clean
-./install-daemon.sh --remove   # if the daemon is installed
-sudo rm /usr/local/bin/hm
+./install.sh --uninstall   # stops the service, runs hm --clean, removes the installed files
 ```
 
-`--remove` stops and removes `hm-daemon.service` and `/usr/local/bin/hm-daemon`. Drop-ins (made with `--configure` or `systemctl edit`) are left in `/etc/systemd/system/hm-daemon.service.d/`, so your settings survive a later install; remove the directory manually if needed.
+Drop-ins (made with `hm-setup` or `systemctl edit`) are left in `/etc/systemd/system/hm-daemon.service.d/`, so your settings survive a later install; remove the directory manually if needed.
 
 ## Usage
 
@@ -314,7 +335,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 | `failure` | continue | continue | **blocked** | **blocked** | **blocked** |
 | `partial` | continue | **blocked** | **blocked** | **blocked** | **blocked** |
 
-`mirrors` and `mirrors-partial` block only on a verdict about the mirrors: the API answered, and what it said leaves a list without usable healthy mirrors. They never block because of the network. `failure` and `partial` are the strict modes: they block whenever the check did not fully succeed, whatever the reason (also when only one of the two APIs was unavailable). `partial` additionally blocks on a single skipped list. `off` never blocks. If one list is permanently skipped (for example because the API data for it is wrong), `mirrors-partial` and `partial` make every first start fail once; `mirrors` or `failure` is the better choice then. Change it with `./install-daemon.sh --configure` or with a systemd drop-in:
+`mirrors` and `mirrors-partial` block only on a verdict about the mirrors: the API answered, and what it said leaves a list without usable healthy mirrors. They never block because of the network. `failure` and `partial` are the strict modes: they block whenever the check did not fully succeed, whatever the reason (also when only one of the two APIs was unavailable). `partial` additionally blocks on a single skipped list. `off` never blocks. If one list is permanently skipped (for example because the API data for it is wrong), `mirrors-partial` and `partial` make every first start fail once; `mirrors` or `failure` is the better choice then. Change it with `sudo hm-setup` or with a systemd drop-in:
 
 ```bash
 sudo systemctl edit hm-daemon.service
@@ -357,12 +378,12 @@ Known limitations of blocking mode:
 The easy way is the interactive setup, which explains every option, offers the current value as the default and validates your answers with the same rules as the daemon:
 
 ```bash
-./install-daemon.sh --configure
+sudo hm-setup
 ```
 
-For each option it shows a colored description (with a table of values for `DENY_ON`) and an overview and summary table. It asks for `DENY_ON`, `COOLDOWN`, `HM_TIMEOUT`, `HELPERS_RE`, `SHELLY_RE`, `WATCH`, `MAX_HELD`, `STOP_GRACE` and `RECHECK` (press Enter to keep the value in brackets, type `default` to restore the built-in default), shows a summary and applies it only after you confirm. The answers are written to `/etc/systemd/system/hm-daemon.service.d/hm-config.conf` (only the values that differ from the defaults; if none do, the file is removed), then the service is restarted. **If the service does not start with the new settings, the previous settings are restored.** You can run it again at any time; the current values are read back from that file. `HM` (the path of the script) is not offered, because the installer verifies that path and generates the sandbox for it. The service must be installed first, and a terminal is required.
+For each option it shows a colored description (with a table of values for `DENY_ON`) and an overview and summary table. It asks for `DENY_ON`, `COOLDOWN`, `HM_TIMEOUT`, `HELPERS_RE`, `SHELLY_RE`, `WATCH`, `MAX_HELD`, `STOP_GRACE` and `RECHECK` (press Enter to keep the value in brackets, type `default` to restore the built-in default), shows a summary and applies it only after you confirm. The answers are written to `/etc/systemd/system/hm-daemon.service.d/hm-config.conf` (only the values that differ from the defaults; if none do, the file is removed), then the service is enabled and restarted. **If the service does not start with the new settings, the previous settings are restored.** You can run it again at any time; the current values are read back from that file. `HM` (the path of the script) is not offered, because `hm-setup` verifies that path and the sandbox is generated for it. A terminal is required (`hm-setup --defaults` works without one).
 
-Settings made by hand with `systemctl edit` (`override.conf`) sort after `hm-config.conf` and win over it; `--configure` warns if such a file sets the same options.
+Settings made by hand with `systemctl edit` (`override.conf`) sort after `hm-config.conf` and win over it; `hm-setup` warns if such a file sets the same options.
 
 To set variables by hand instead, use a systemd drop-in:
 
@@ -378,7 +399,7 @@ Environment="HELPERS_RE=yay|paru"
 
 | Variable | Default | Meaning |
 |---|---|---|
-| `HM` | `/usr/local/bin/hm` | Script to run (absolute path) |
+| `HM` | `/usr/local/bin/hm` | Script to run (absolute path); the unit sets it to the installed path |
 | `HM_TIMEOUT` | `45` | Seconds before `hm` is killed (> 0). One run can take up to 30 s on a very slow network (three downloads, each limited to 10 s), so keep it above that |
 | `COOLDOWN` | `60` | Minimum seconds between `hm` runs (≥ 0). In blocking mode also the window in which a blocked program can be started again |
 | `WATCH` | `/etc/pacman.conf` | Files to monitor (colon-separated, at least one) |
@@ -393,9 +414,9 @@ Numbers must be finite; a value that does not match its constraint makes the ser
 
 ### Security
 
-The daemon runs as root and executes `/usr/local/bin/hm` as root. `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `install-daemon.sh` checks this when installing.
+The daemon runs as root and executes `hm` as root (`/usr/bin/hm` from the package, `/usr/local/bin/hm` from `install.sh`). `hm` and its parent directories must be owned by root, must not be symlinks and must not be writable by group or others; `hm-setup` checks this when it starts the service.
 
-The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces, no writable-and-executable memory (`MemoryDenyWriteExecute`), a `/proc` that shows only process directories (`ProcSubset=pid`) and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The generated unit (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
+The service is sandboxed with `ProtectSystem=strict`, `NoNewPrivileges`, `ProtectHome=read-only`, private `/tmp` and `/dev`, protected kernel interfaces, no writable-and-executable memory (`MemoryDenyWriteExecute`), a `/proc` that shows only process directories (`ProcSubset=pid`) and a restricted set of address families. It may write only to the directories of the managed mirrorlists (`hm` replaces files by rename, which needs directory access). Inside them, `hooks/` and `gnupg/` (pacman runs hooks as root; `gnupg` is the package keyring) and any `HookDir`/`GPGDir` reported by `pacman-conf` are read-only. The unit with its drop-ins (`systemctl cat hm-daemon.service`) has a comment for every non-obvious setting.
 
 Capabilities are limited to three, all verified to be necessary:
 
@@ -534,7 +555,7 @@ A successful run ends with `passed: N, failed: 0` and exit status 0 (`skipped` c
 
 ### What the tests do not cover
 
-Neither script covers mirror evaluation and transactional updates of `hm` with real writes, desktop notifications, the systemd sandbox or the installers (including `--configure`). Check those with:
+Neither script covers mirror evaluation and transactional updates of `hm` with real writes, desktop notifications, the systemd sandbox or the installer and `hm-setup`. Check those with:
 
 ```bash
 hm --dry-run; echo "exit=$?"     # what a run would change, nothing is written; 0, 1, 2 or 3
@@ -546,24 +567,16 @@ journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman
 
 To try the blocking mode by hand (it is on by default), make `hm` report a bad result, for example by choosing `DENY_ON=partial` and going offline (exit `3`, blocked only in the strict modes), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass. In the default mode going offline only produces the warning `hm could not get the mirror status (exit code 3)` and the program continues.
 
-Installer rollback (installs a deliberately broken daemon and checks that the previous version returns):
-
-```bash
-{ head -n1 hm-daemon; echo 'raise SystemExit(3)'; tail -n +2 hm-daemon; } > /tmp/hm-daemon-broken
-SRC=/tmp/hm-daemon-broken ./install-daemon.sh; echo "exit=$?"   # expected: update rolled back, exit=1
-systemctl is-active hm-daemon.service                           # expected: active (previous version)
-cmp hm-daemon /usr/local/bin/hm-daemon && echo "previous version restored"
-rm -f /tmp/hm-daemon-broken
-```
-
 ## Repository files
 
 | File | Purpose |
 |---|---|
 | `hm` | The mirror health check |
 | `hm-daemon` | The optional fanotify service that runs `hm` before `pacman`/`shelly` read the mirror lists |
-| `install.sh` | Installs `hm` to `/usr/local/bin` |
-| `install-daemon.sh` | Installs, updates (with rollback), configures interactively (`--configure`) or removes (`--remove`) the hardened `hm-daemon.service` |
+| `hm-daemon.service` | The hardened systemd unit of the daemon |
+| `hm-setup` | Configures (interactively), starts, refreshes or removes the service |
+| `install.sh` | Installs/uninstalls `hm`, `hm-daemon`, `hm-setup` and the unit from a git checkout |
+| `PKGBUILD`, `healthy-mirrors.install` | Arch Linux package |
 | `test-hm-daemon.sh` | Tests for the daemon |
 | `test-hm-api.sh` | Tests for the CachyOS API fallback of `hm`, the independence of the two APIs and a comparison of the two CachyOS APIs |
 | `docs/` | Images used in this README |

@@ -347,7 +347,7 @@ if [[ "${#MIRRORLISTS[@]}" -eq 0 ]]; then
     die 'no existing mirrorlist files found in /etc/pacman.conf'
 fi
 
-# --list: the single source of truth for which files hm updates (used by install-daemon.sh)
+# --list: the single source of truth for which files hm updates (used by hm-setup)
 if [[ "$LIST" -eq 1 ]]; then
     printf '%s\n' "${MIRRORLISTS[@]}"
     exit 0

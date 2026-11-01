@@ -1,0 +1,50 @@
+[Unit]
+Description=Run hm before pacman/shelly read pacman.conf and mirrorlist
+Documentation=https://github.com/mtriam/healthy-mirrors
+After=local-fs.target
+# A permanent startup error ends in a visible failed state instead of an endless restart loop
+StartLimitIntervalSec=60
+StartLimitBurst=5
+
+[Service]
+Type=simple
+Environment=HM=/usr/bin/hm
+ExecStart=/usr/bin/hm-daemon
+# Keep the guard running even if it is killed or exits cleanly outside of systemd
+Restart=always
+RestartSec=1
+
+# --- Hardening ---------------------------------------------------------------
+NoNewPrivileges=yes
+ProtectSystem=strict
+# Directory of the mirrorlists hm updates (it replaces files by rename). "hm-setup"
+# adds the directories reported by "hm --list" in a drop-in (10-hm-paths.conf).
+ReadWritePaths=-/etc/pacman.d
+# pacman runs hooks as root and gnupg holds the package keyring: not writable for the service
+ReadOnlyPaths=-/etc/pacman.d/hooks -/etc/pacman.d/gnupg
+ProtectHome=read-only
+PrivateTmp=yes
+PrivateDevices=yes
+ProtectKernelTunables=yes
+ProtectKernelModules=yes
+ProtectKernelLogs=yes
+ProtectControlGroups=yes
+ProtectClock=yes
+ProtectHostname=yes
+RestrictNamespaces=yes
+RestrictRealtime=yes
+RestrictSUIDSGID=yes
+LockPersonality=yes
+SystemCallArchitectures=native
+MemoryDenyWriteExecute=yes
+ProcSubset=pid
+UMask=0077
+# CAP_SYS_ADMIN: fanotify_init with permission events (verified: without it the daemon
+#   stops with "fanotify_init: Operation not permitted")
+# CAP_SETUID, CAP_SETGID: hm switches to the logged-in user (setpriv) to show desktop
+#   notifications (verified: without them setpriv fails with "Operation not permitted")
+CapabilityBoundingSet=CAP_SYS_ADMIN CAP_SETUID CAP_SETGID
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6 AF_NETLINK
+
+[Install]
+WantedBy=multi-user.target

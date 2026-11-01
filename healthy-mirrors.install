@@ -1,0 +1,25 @@
+post_install() {
+    echo ':: healthy-mirrors: run "sudo hm-setup" to configure and start hm-daemon'
+    echo '   (optional: it runs hm automatically before pacman/shelly; without it run "hm" yourself)'
+}
+
+post_upgrade() {
+    # regenerate the sandbox paths and restart the daemon if it was set up
+    if [ -d /run/systemd/system ] && systemctl is-enabled --quiet hm-daemon.service 2>/dev/null; then
+        /usr/bin/hm-setup --refresh ||
+            echo ':: healthy-mirrors: "hm-setup --refresh" failed; run it by hand' >&2
+    fi
+}
+
+pre_remove() {
+    if [ -d /run/systemd/system ]; then
+        /usr/bin/hm-setup --remove || true
+    fi
+    # otherwise the commented-out (#UH#) mirrors would stay disabled
+    /usr/bin/hm --clean ||
+        echo ':: healthy-mirrors: could not remove the #UH# markers; run "hm --clean" by hand' >&2
+}
+
+post_remove() {
+    echo ':: healthy-mirrors: settings are kept in /etc/systemd/system/hm-daemon.service.d/ (remove them by hand if not needed)'
+}
