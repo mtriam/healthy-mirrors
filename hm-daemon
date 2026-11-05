@@ -304,7 +304,12 @@ def sync_ops(opts):
 
 
 def should_trigger(comm, args):
-    opts = [a for a in args[1:] if a.startswith("-")]
+    opts = []
+    for a in args[1:]:
+        if a == "--":                     # everything after "--" is an operand, not an option
+            break
+        if a.startswith("-"):
+            opts.append(a)
     if comm == "pacman":
         # only operations that use mirrors: sync, upgrade, file-database refresh (not -Q, -T, -V, ...)
         return sync_ops(opts)

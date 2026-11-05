@@ -26,14 +26,21 @@ ok()  { printf 'PASS  %s\n' "$1"; PASS=$((PASS + 1)); }
 bad() { printf 'FAIL  %s\n' "$1"; FAIL=$((FAIL + 1)); }
 
 echo '[options]' > "$CONF"
-ln -s /usr/bin/cat "$T/pacman"                         # a process named "pacman"
+# a fake "pacman": the shell itself opens the file (so the process name stays "pacman");
+# the options come first and the file is the last argument
+cat > "$T/pacman" <<'EOS'
+#!/bin/bash
+for f; do :; done
+while IFS= read -r l || [[ -n $l ]]; do printf '%s\n' "$l"; done < "$f"
+EOS
+chmod +x "$T/pacman"
 printf '#!/bin/sh\nexec sleep "${SLOW:-0.3}"\n' > "$T/slow-hm"
 chmod +x "$T/slow-hm"
 
-pac()     { "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1; }   # looks like "pacman --sync", opens the file
+pac()     { "$T/pacman" --sync "$CONF" >/dev/null 2>&1; }   # looks like "pacman --sync", opens the file
 # like pac, but succeeds only if the open() of the file was denied: cat then prints nothing of
 # the file on stdout (the error message is language dependent, so it is not looked at)
-denied()  { local out; out=$(timeout 10 "$T/pacman" -- --sync "$CONF" 2>/dev/null); [[ $out != *"[options]"* ]]; }
+denied()  { local out; out=$(timeout 10 "$T/pacman" --sync "$CONF" 2>/dev/null); [[ $out != *"[options]"* ]]; }
 started() { grep -c '^started ' "$LOG"; }
 secs()    { awk -v a="$1" -v b="$(date +%s.%N)" 'BEGIN { printf "%.1f", b - a }'; }
 between() { awk -v v="$1" -v lo="$2" -v hi="$3" 'BEGIN { exit !(v >= lo && v <= hi) }'; }
@@ -113,7 +120,7 @@ stop_daemon
 
 echo "== 5. hm cannot be started"
 start_daemon HM=/nonexistent
-timeout 3 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
+timeout 3 "$T/pacman" --sync "$CONF" >/dev/null 2>&1
 [[ $? -ne 124 ]] && ok "request was not left blocked" || bad "request stayed blocked"
 grep -q 'cannot start' "$LOG" && ok "start failure logged" || bad "start failure not logged"
 stop_daemon
@@ -205,6 +212,9 @@ cases = [
     ("octopi", ["octopi"], True),
     ("octopi-notifier", ["octopi-notifier"], False),
     ("shelly", ["shelly", "sync", "--force"], True),
+    ("pacman", ["pacman", "-Q", "--", "-Sfoo"], False),
+    ("yay",    ["yay", "--", "firefox"], True),
+    ("pacman", ["pacman", "-S", "--", "foo"], True),
     ("cat",    ["cat", "-S"], False),
 ]
 bad = 0
@@ -255,7 +265,7 @@ chmod +x "$T/fail-hm"
 
 echo "== 12. hm fails: the request is released and the failure is logged at error priority"
 start_daemon HM="$T/fail-hm"
-timeout 5 "$T/pacman" -- --sync "$CONF" >/dev/null 2>&1
+timeout 5 "$T/pacman" --sync "$CONF" >/dev/null 2>&1
 [[ $? -ne 124 ]] && ok "request was released after a failed hm" || bad "request stayed blocked"
 grep -qF '<3>hm FAILED (exit code 1)' "$LOG" && ok "failure logged with error priority" \
                                               || bad "failure not logged as expected"
@@ -296,7 +306,7 @@ stop_daemon
 
 echo "== 16. only processes that would trigger hm are denied; others that were held pass"
 start_daemon HM="$T/slowfail-hm" DENY_ON=failure
-( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & P1=$!
+( "$T/pacman" --sync "$CONF" > "$T/out.pac" 2>&1 ) & P1=$!
 sleep 0.3
 ( cat "$CONF" > "$T/out.cat" 2>&1 ) & P2=$!
 wait "$P1" "$P2"
@@ -327,7 +337,7 @@ stop_daemon
 
 echo "== 19. stopping the daemon never denies"
 start_daemon SLOW=20 STOP_GRACE=1 DENY_ON=partial
-( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
+( "$T/pacman" --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
 sleep 1
 kill -TERM "$DPID"
 wait "$PP" 2>/dev/null
@@ -364,7 +374,7 @@ stop_daemon
 
 echo "== 23. a stop that also terminates hm (systemd signals the whole service) never denies"
 start_daemon SLOW=20 STOP_GRACE=5 DENY_ON=partial
-( "$T/pacman" -- --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
+( "$T/pacman" --sync "$CONF" > "$T/out.pac" 2>&1 ) & PP=$!
 sleep 1
 pkill -TERM -f '^sleep 20$'                    # hm first: the hardest order for the daemon
 kill -TERM "$DPID"

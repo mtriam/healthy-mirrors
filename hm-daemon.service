@@ -18,7 +18,7 @@ RestartSec=1
 NoNewPrivileges=yes
 ProtectSystem=strict
 # Directory of the mirrorlists hm updates (it replaces files by rename). "hm-setup"
-# adds the directories reported by "hm --list" in a drop-in (10-hm-paths.conf).
+# replaces this default with the directories reported by "hm --list" in a drop-in (10-hm-paths.conf).
 ReadWritePaths=-/etc/pacman.d
 # pacman runs hooks as root and gnupg holds the package keyring: not writable for the service
 ReadOnlyPaths=-/etc/pacman.d/hooks -/etc/pacman.d/gnupg

@@ -485,7 +485,7 @@ There are two test scripts. Neither writes to `/etc` or needs the daemon to be i
 
 ### hm-daemon (`test-hm-daemon.sh`)
 
-`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a symlink named `pacman` to `cat` as a fake client. Test 9 imports `hm-daemon` as a module (nothing is started) to check how command lines are classified. The `hm` stubs exit with `1` (error / no healthy mirror), `2` (some lists skipped) or `3` (mirror status unavailable), like the real `hm`.
+`test-hm-daemon.sh` exercises `hm-daemon` against a scratch file in `/tmp`. It never touches `/etc/pacman.conf`, the installed service or the mirrorlists: it starts its own daemon instances (with `COOLDOWN=0`, `RECHECK=0` and a stub instead of `hm`) and uses a small script named `pacman` that opens the file as a fake client. Test 9 imports `hm-daemon` as a module (nothing is started) to check how command lines are classified. The `hm` stubs exit with `1` (error / no healthy mirror), `2` (some lists skipped) or `3` (mirror status unavailable), like the real `hm`.
 
 ```bash
 ./test-hm-daemon.sh                      # uses ./hm-daemon
@@ -504,7 +504,7 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 6 | `hm` exceeds `HM_TIMEOUT` and has a child in another session: both are killed and the request is released |
 | 7 | Invalid configuration (`MAX_HELD=0`, `HM_TIMEOUT=nan`, `DENY_ON=abc`): the daemon exits with status 1 and names the variable |
 | 8 | A symlinked watch path with `RECHECK=0` produces a warning that replacement will not be detected |
-| 9 | Classification of 39 command lines: short and long `pacman` options (including `-F -y`, `--files -y`, `-b/path`), AUR helpers, `shelly`, other programs |
+| 9 | Classification of 42 command lines: short and long `pacman` options (including `-F -y`, `--files -y`, `-b/path`), AUR helpers, `shelly`, other programs |
 | 10 | The log names every process that opens the file, but shows command lines only for `pacman`, AUR helpers and `shelly` |
 | 11 | Cooldown: a fresh daemon starts `hm` for the first request, a second request within the cooldown does not start it again |
 | 12 | `hm` exits with an error (`1`): the request is released and the failure is logged at error priority |
