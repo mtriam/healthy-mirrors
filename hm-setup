@@ -97,6 +97,31 @@ check_trusted() {
 check_trusted "$HM"
 check_trusted "$DAEMON"
 
+# A directory that gets write access in the sandbox (hm creates and renames files there as
+# root): the path must contain no symlink, and every component up to / must be a directory
+# owned by root. Writable by others: error. Writable by the group: only a warning, because
+# giving a group access is the administrator's decision.
+check_rw_dir() {
+    local d=$1 real p perms
+    real=$(readlink -f -- "$d")
+    [[ $real == "$d" ]] ||
+        die "$d is, or sits behind, a symlink (resolves to $real); use the real path in the Include lines of pacman.conf"
+    p=$d
+    while :; do
+        [[ -d $p ]] || die "$p is not a directory"
+        [[ $(stat -c %u -- "$p") == 0 ]] || die "$p is not owned by root (it holds mirrorlists that hm replaces as root)"
+        perms=$(stat -c %A -- "$p")
+        if [[ ${perms:8:1} == w ]]; then
+            die "$p is writable by others ($perms); fix: sudo chmod o-w $p"
+        fi
+        if [[ ${perms:5:1} == w ]]; then
+            warn "$p is writable by its group ($perms); only root should write there. To tighten: sudo chmod g-w $p"
+        fi
+        [[ $p == / ]] && break
+        p=$(dirname -- "$p")
+    done
+}
+
 join_list() {
     local out='' x
     for x in "$@"; do out+="${out:+, }$x"; done
@@ -124,6 +149,7 @@ for d in "${RW_DIRS[@]}"; do
             die "refusing to make $d writable for the service (mirrorlists belong in a dedicated directory)" ;;
     esac
     [[ -d $d ]] || die "mirrorlist directory does not exist: $d"
+    check_rw_dir "$d"
     RW+="-$d "
 done
 RW="${RW% }"

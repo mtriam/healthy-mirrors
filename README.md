@@ -146,7 +146,8 @@ The package installs `hm`, `hm-daemon` and `hm-setup` to `/usr/bin` and `hm-daem
 - asks `hm --list` which mirrorlists exist and writes the matching sandbox paths into a drop-in (`/etc/systemd/system/hm-daemon.service.d/10-hm-paths.conf`),
 - asks for the daemon options (see [Configuration](#configuration)) and writes the values that differ from the defaults to `hm-config.conf` in the same directory,
 - enables and starts the service. **If the service does not stay up for 2 seconds, the previous settings and state are restored.**
-- checks that `hm` and every path component up to `/` are root-owned, not symlinks and not group/world-writable.
+- checks that `hm`, `hm-daemon` and every path component up to `/` are root-owned, not symlinks and not group/world-writable.
+- checks the directories of the mirrorlists (the ones the service may write to): no symlink in the path, every component owned by root, none writable by others (an error). A component that is writable by its group only produces a warning with the `chmod g-w` command that fixes it.
 
 | Command | Meaning |
 |---|---|
