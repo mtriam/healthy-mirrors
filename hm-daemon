@@ -6,8 +6,11 @@ fanotify permission events are tied to an inode. When a watched file is replaced
 inotify watch on the parent directory re-marks the new file immediately. A slow
 periodic check (RECHECK) is kept as a safety net.
 
-All intervals (cooldown, timeouts, grace period, periodic check) use the monotonic
-clock, so changes of the system time cannot shorten or extend them.
+The hm timeout, the stop grace period and the periodic check use the monotonic clock, so
+changes of the system time cannot shorten or extend them (and a suspend does not count as
+time hm has been running). The cooldown uses CLOCK_BOOTTIME instead: it also counts the time
+the system was suspended, so a program started after a resume is checked again when the
+cooldown ran out during the sleep. Changes of the system time do not affect it either.
 
 By default (DENY_ON=mirrors-partial) the daemon answers FAN_DENY (the open() fails with
 EPERM) to the programs that would trigger hm themselves when the mirror status was obtained
@@ -103,6 +106,13 @@ def log(msg, level=""):
 def on_stop(signum, frame):
     global STOP
     STOP = True
+
+
+def boottime():
+    """Seconds on CLOCK_BOOTTIME: like the monotonic clock (not affected by changes of the
+    system time), but it keeps running while the system is suspended. Used for the cooldown,
+    so that time spent asleep counts as time passed."""
+    return time.clock_gettime(time.CLOCK_BOOTTIME)
 
 
 # ---------------------------------------------------------------------------
@@ -471,7 +481,7 @@ def run():
     # held: [(event fd, pid, deny candidate)] of the requests that wait for the running hm
     held, hm = [], None
     t0 = 0.0
-    last = -math.inf                      # no hm run yet: the cooldown is not active
+    last = -math.inf                      # no hm run yet: the cooldown is not active (boottime clock)
     limit_logged = False
     stopping, stop_deadline = False, 0.0
     next_check = time.monotonic() + RECHECK if RECHECK > 0 else None
@@ -502,7 +512,7 @@ def run():
         nonlocal hm, last
         n = len(held)
         log(f"releasing {n} held open() calls ({reason})")
-        hm, last = None, time.monotonic()
+        hm, last = None, boottime()           # the cooldown starts now and also counts suspend time
         if deny:
             victims = [e for e in held if e[2]]
             if victims:
@@ -612,7 +622,7 @@ def run():
                         except Exception as e:           # a bug in classification must not take the daemon down
                             log(f"cannot classify pid={pid}: {e!r}; letting it through", WARN)
                             comm, args, client, ok = "?", [], False, False
-                        cool = time.monotonic() - last < COOLDOWN
+                        cool = boottime() - last < COOLDOWN
                         cmd = f" cmd={' '.join(args)[:100]!r}" if client else ""
                         log(f"open pid={pid} comm={comm}{cmd} trigger={ok} cooldown={cool}")
                         if ok and not cool:
@@ -621,7 +631,7 @@ def run():
                                                       start_new_session=True, env=hm_env())
                             except OSError as e:
                                 log(f"cannot start {HM}: {e}", ERR)
-                                last = time.monotonic()  # do not retry on every open
+                                last = boottime()        # do not retry on every open
                                 deny_start = "infra" in DENY_SET
                                 if deny_start:
                                     log(f"denying pid {pid} (DENY_ON={DENY_ON}): it fails with EPERM; "
