@@ -165,18 +165,18 @@ makepkg -si           # rebuilds and reinstalls the package; a running daemon is
 ```
 
 - The version changes with every new commit.
-- **Coming from `install.sh` or the old `install-daemon.sh`** (files in `/usr/local/bin`): `/usr/local/bin` comes before `/usr/bin` in `PATH`, and `/etc/systemd/system/hm-daemon.service` overrides the unit of the package. **Before the first `makepkg -si`**, remove the old files once:
+- **Coming from an older manual installation** (the old `install-daemon.sh`, or an old `install.sh` that copied files to `/usr/local/bin`): `/usr/local/bin` comes before `/usr/bin` in `PATH`, and `/etc/systemd/system/hm-daemon.service` overrides the unit of the package. **Before the first `makepkg -si`**, remove the old files once:
 
-  ````bash
+  ```bash
   sudo systemctl disable --now hm-daemon.service
   sudo rm -f /etc/systemd/system/hm-daemon.service /usr/local/bin/hm /usr/local/bin/hm-daemon /usr/local/bin/hm-setup
   sudo systemctl daemon-reload
   hash -r
-  ````
+  ```
 
   Then install the package and set the daemon up again:
 
-  ````bash
+  ```bash
   makepkg -si && sudo hm-setup --defaults
   ```
 - **Installation:** only the package (`makepkg -si`) is supported. `hm-setup` configures and starts the daemon, and the package refreshes its sandbox paths on every upgrade (`hm-setup --refresh`).
