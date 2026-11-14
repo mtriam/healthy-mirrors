@@ -748,7 +748,7 @@ fetch_cachyos_api() {
 
     FETCH_ERROR=''
 
-    if ! out=$(curl --connect-timeout 5 --max-time 10 -fsSL "$url" -o "$file" 2>&1); then
+    if ! out=$(curl --connect-timeout 5 --max-time 10 --compressed -fsSL "$url" -o "$file" 2>&1); then
         out=${out//$'\n'/ }
         FETCH_ERROR="download failed${out:+: $out}"
         return 1
@@ -784,7 +784,7 @@ fetch_arch_api() {
 
     FETCH_ERROR=''
 
-    if ! out=$(curl --connect-timeout 5 --max-time 10 -fsSL "$ARCH_API" -o "$JSON_ARCH" 2>&1); then
+    if ! out=$(curl --connect-timeout 5 --max-time 10 --compressed -fsSL "$ARCH_API" -o "$JSON_ARCH" 2>&1); then
         out=${out//$'\n'/ }
         FETCH_ERROR="download failed${out:+: $out}"
         return 1
