@@ -58,6 +58,8 @@ For CachyOS, `hm` judges every mirrorlist by the repositories that `pacman.conf`
 
 For Arch Linux mirrors, it keeps only active HTTPS mirrors **that are fully synchronized (`completion_pct = 1.0`), have a reported synchronization time, and have a delay of less than one hour**.
 
+The Arch Linux status data comes from a periodic check by archlinux.org (its `last_check` field) and can be minutes old; `hm` trusts it as it is. If it is older than `HM_MAX_SNAPSHOT_AGE` seconds (default `3600`, `0` turns it off), `hm` prints a warning on stderr (in the journal when the daemon runs it). Nothing else changes: no exit status, no notification, no different decision.
+
 The script updates the mirrorlist files by commenting out unhealthy mirrors with a `#UH#` marker while leaving healthy mirrors active. It removes existing markers before re-evaluating the mirrors, so the status is refreshed on each run. Use `hm --clean` to remove the markers.
 
 Only mirrors that the APIs know are ever disabled: a mirror is commented out when the API lists it and reports it as unhealthy. Mirrors the APIs do not list at all (a local cache, your own server, a company mirror, ...) are left exactly as they are and count as active in the summary. For example, on CachyOS the `cachyos-rate-mirrors` tool typically puts `https://archlinux.cachyos.org/repo/$repo/os/$arch` at the top of `/etc/pacman.d/mirrorlist`; the Arch mirror status API does not list it, so `hm` keeps it and the Arch list is summarized as `, 1 other`. `hm` cannot judge such mirrors: if one of them is unreachable from your location, remove it from the list yourself. Side effect: a mirror that has been removed from the API, or a variant of a mirror (for example `http://`) that the API does not list, also stays active.
@@ -212,6 +214,8 @@ hm
 | `-h`, `--help` | Show the help message |
 
 `--list` and `--notify-test` cannot be combined with other options; `--dry-run` can be combined with `--clean`. Set `HM_NOTIFY=auto|always|never` to control desktop notifications on errors (default `auto`, see [Error notifications](#error-notifications); notifications are always off with `--dry-run` and `--list`).
+
+Set `HM_MAX_SNAPSHOT_AGE=<seconds>` to change when `hm` warns about old Arch Linux status data (default `3600`, `0` = never, see [Health rules](#health-rules)).
 
 Both `hm` and `hm --clean` compare the generated result with the current file before writing changes, so an unchanged run does not ask for `sudo`.
 
@@ -555,6 +559,7 @@ Part 1 replaces `curl` with a stub that serves canned data; part 2 downloads the
 | 12 | An API that no managed list uses is not downloaded, and its outage does not matter (skipped on systems that have both CachyOS and Arch Linux lists) |
 | 13 | One malformed CachyOS entry (a `url` without `checks`) among valid ones: it is reported, and its mirror is not treated as known, so it stays active and its list is not skipped |
 | 14 | The same for the Arch Linux API (an entry without `protocol`) |
+| 15 | Old Arch Linux status data (`last_check`): a warning is printed and nothing else changes; fresh data, data without `last_check` and `HM_MAX_SNAPSHOT_AGE=0` print none |
 
 Test 7 prints a `NOTE` line on whether the two responses are also identical byte for byte after key normalization (`jq -S`); a difference in fields that `hm` does not use is not a failure. The two real APIs are downloaded seconds apart, so if test 7 fails, run it again before investigating. The jq filters in the test's `derive` function copy those in `hm`; if you change the health rules in `hm`, change them there as well.
 

@@ -858,6 +858,45 @@ else
     fi
 fi
 
+echo "== 15. old Arch Linux status data: a warning only (HM_MAX_SNAPSHOT_AGE)"
+
+if (( ! HAS_ARCH )); then
+    skip "no Arch Linux mirrorlist on this system"
+else
+    jq '. + {last_check: "2020-01-01T00:00:00.000Z"}' "$T/arch.json" > "$T/arch-old.json"
+    jq --arg t "$(date -u +%Y-%m-%dT%H:%M:%S.000Z)" '. + {last_check: $t}' "$T/arch.json" > "$T/arch-fresh.json"
+
+    run_hm "$T/cachyos.json" fail "$T/arch-fresh.json"
+    RC_FRESH=$RC
+    OUT_FRESH=$OUT
+
+    has "$ERR" 'Arch Linux mirror status is' \
+        && bad "warning for fresh status data: $ERR" \
+        || ok "fresh status data: no warning"
+
+    run_hm "$T/cachyos.json" fail "$T/arch.json"
+    has "$ERR" 'Arch Linux mirror status is' \
+        && bad "warning although the data has no last_check: $ERR" \
+        || ok "no last_check in the data: no warning"
+
+    run_hm "$T/cachyos.json" fail "$T/arch-old.json"
+    has "$ERR" 'Arch Linux mirror status is' \
+        && ok "old status data: warning printed" \
+        || bad "no warning for old status data: $ERR"
+
+    [[ $RC -eq $RC_FRESH && $OUT == "$OUT_FRESH" ]] \
+        && ok "the warning changes neither the decisions nor the exit status" \
+        || bad "result differs from the run with fresh data (exit $RC, expected $RC_FRESH)"
+
+    export HM_MAX_SNAPSHOT_AGE=0
+    run_hm "$T/cachyos.json" fail "$T/arch-old.json"
+    unset HM_MAX_SNAPSHOT_AGE
+
+    has "$ERR" 'Arch Linux mirror status is' \
+        && bad "warning although HM_MAX_SNAPSHOT_AGE=0: $ERR" \
+        || ok "HM_MAX_SNAPSHOT_AGE=0 turns the warning off"
+fi
+
 echo
 echo "passed: $PASS, failed: $FAIL, skipped: $SKIP"
 

@@ -25,6 +25,8 @@ Exit status:
 Environment:
   HM_NOTIFY=auto|always|never   desktop notifications on errors
                                 (default: auto = only when not run in a terminal)
+  HM_MAX_SNAPSHOT_AGE=SECONDS   warn when the Arch Linux mirror status is older than this
+                                (default: 3600, 0 = off); a warning only
   HM_DENY_ON, HM_DENY_RETRY     set by hm-daemon when its DENY_ON mode is enabled
                                 (failure|partial|mirrors|mirrors-partial);
                                 only used to add a hint to warnings and notifications
