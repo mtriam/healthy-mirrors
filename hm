@@ -64,6 +64,9 @@ fi
 CACHYOS_API='https://cachyos.org/archlinuxmirrorlist/api/cachyos-mirrors'
 CACHYOS_API_FALLBACK='https://dashboard.cachyos.org/api/v1/mirrors'
 ARCH_API='https://archlinux.org/mirrors/status/json/'
+# Age (seconds) of the Arch Linux status data (its "last_check") above which hm warns;
+# 0 turns the warning off. Only a warning: it never changes what hm does.
+MAX_SNAPSHOT_AGE="${HM_MAX_SNAPSHOT_AGE:-3600}"
 MARK='#UH#'
 STALE_MINUTES=1440      # staging files older than this are leftovers of a killed update
 NOTIFY_MODE="${HM_NOTIFY:-auto}"
@@ -944,9 +947,32 @@ load_cachyos() {
     return 0
 }
 
+# Warn when the Arch Linux status data is old: hm trusts it as it is, so a mirror that
+# stopped syncing after the last check still looks healthy. Warning only (stderr).
+check_snapshot_age() {
+    local age
+
+    [[ "$MAX_SNAPSHOT_AGE" =~ ^[0-9]+$ ]] || MAX_SNAPSHOT_AGE=3600
+    (( MAX_SNAPSHOT_AGE > 0 )) || return 0
+
+    age=$(jq -r '
+        (.last_check | strings | sub("\\.[0-9]+Z$"; "Z") | fromdateiso8601) as $t
+        | (now - $t) | floor
+    ' "$JSON_ARCH" 2>/dev/null) || return 0
+    [[ "$age" =~ ^-?[0-9]+$ ]] || return 0
+
+    if (( age > MAX_SNAPSHOT_AGE )); then
+        printf 'hm: warning: the Arch Linux mirror status is %d min old (last check by archlinux.org); mirrors may have changed since\n' \
+            "$((age / 60))" >&2
+    fi
+
+    return 0
+}
+
 # The same for the Arch Linux API (no fallback address).
 load_arch() {
     fetch_arch_api || return 1
+    check_snapshot_age
 
     jq -r '
         .urls[]
