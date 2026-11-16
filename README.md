@@ -1,6 +1,6 @@
 # healthy-mirrors
 
-Checks mirror health and automatically keeps only healthy mirrors active, reducing the risk of partial upgrades caused by mirrors that are out of sync.
+Checks mirror health and automatically keeps only healthy mirrors active, so that upgrades fail less often and `pacman` does not waste time on mirrors that are out of sync or dead.
 
 ## Quick start
 
@@ -11,16 +11,31 @@ git clone https://github.com/mtriam/healthy-mirrors.git && \
 cd healthy-mirrors && makepkg -si && sudo hm-setup --defaults
 ```
 
-That's it! `makepkg -si` builds and installs the package and `hm-setup --defaults` enables and starts `hm-daemon` with the default settings (no questions asked). The daemon automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, helping reduce the risk of partial upgrades. The build needs `git` and `base-devel`. To choose the daemon options yourself, run `sudo hm-setup` without `--defaults` (see [hm-setup](#hm-setup)).
+That's it! `makepkg -si` builds and installs the package and `hm-setup --defaults` enables and starts `hm-daemon` with the default settings (no questions asked). The daemon automatically checks mirror health before matching package-management operations. It disables unhealthy or out-of-sync mirrors by commenting them out with a `#UH#` marker, so that `pacman` does not run into them during an upgrade. The build needs `git` and `base-devel`. To choose the daemon options yourself, run `sudo hm-setup` without `--defaults` (see [hm-setup](#hm-setup)).
 
 No aliases or wrappers are needed.
 
-**By default the daemon is strict about mirrors** (`DENY_ON=mirrors-partial`): if the API works but a list has no healthy mirror, or `hm` has to skip a list, the program that triggered the check (`pacman -Syu`, `yay`, ...) is blocked instead of running with outdated lists. If the mirror status of an API cannot be obtained (an API is down or unusable), you only get a warning, the lists of the other API are still checked and updated, and the program continues. **Starting a blocked program again within 60 seconds lets it through.** See [Blocking mode](#blocking-mode-deny_on) to make this stricter, more relaxed, or to turn it off.
+**By default the daemon only checks and warns** (`DENY_ON=off`): if `hm` cannot bring the lists up to date (no healthy mirror, a skipped list, an API that is down), you get a warning in the journal and a desktop notification, and the program that triggered the check continues with the existing lists. A blocking mode (`DENY_ON=mirrors-partial` or stricter) makes the daemon refuse to start `pacman -Syu`, `yay`, ... on lists that `hm` knows to be bad; **starting a blocked program again within 60 seconds lets it through.** See [Blocking mode](#blocking-mode-deny_on) to turn it on.
 
 Example output of hm:  
 ![Example output of hm](docs/output.png)
 
 See [Usage](#usage) for manual operation, [hm-daemon](#hm-daemon) for details and configuration, [Blocking mode](#blocking-mode-deny_on) for making sure nothing runs with outdated lists, and [Limitations](#limitations) for what `hm` deliberately does not do.
+
+## What it is for, and what it is not
+
+An out-of-sync mirror does not normally damage a system by itself. `pacman` asks for every package by the exact file name listed in its databases, so a mirror that is behind answers with an error (404) and `pacman` tries the next mirror; if no server can provide a file, the upgrade stops with an error, before anything is installed. What `hm` is for is avoiding exactly that nuisance: failed or slow upgrades, repeated failovers, and databases and packages that come from mirrors in different states. It keeps only the mirrors that the status APIs report as healthy active, right before the upgrade.
+
+It is not a protection against:
+
+- **Inconsistent repositories at the source.** If the repositories themselves are briefly inconsistent (for example a new kernel is published before the matching out-of-tree module, such as `nvidia`), every mirror has the same problem, healthy or not. Read what an upgrade is going to do before you confirm it.
+- **Partial upgrades caused by the user,** such as `pacman -Sy` followed by installing a package, `IgnorePkg`/`IgnoreGroup`, `--overwrite` or `-dd`.
+- **Packaging errors.** `pacman` only checks the dependencies that packages declare; a package that needs a certain version of another one without saying so is not caught, by `hm` either.
+- **Differences between repositories on CachyOS.** `hm` judges every mirrorlist on its own. It does not compare the CachyOS repositories with the Arch Linux ones, so a CachyOS package that is ahead of or behind the Arch Linux repositories, or one that falls back from an optimized repository to the plain Arch Linux one, is not detected.
+- **Packages from outside the repositories** (for example the AUR) that have to be rebuilt after a library changes.
+- **Interrupted transactions** (power loss, a failed hook). They have nothing to do with the mirrorlist.
+
+Ranking mirrors by speed (for example with `reflector` or `rate-mirrors`) is a separate task that `hm` does not do.
 
 ## What it does
 
@@ -103,7 +118,7 @@ Status `2` also applies to `--dry-run`, so that a preview agrees with a real run
 - **Unmanaged mirrors are never judged** (see above), and a failed run keeps the lists as they were: they may be out of date, never half-written.
 - **Lists without an API are not managed.** A mirrorlist that is neither a CachyOS list nor the Arch Linux list (for example `chaotic-mirrorlist`) is left exactly as it is on every run; it only appears in the summary with its number of active mirrors.
 - **The CachyOS fallback is a second address, not an independent source.** Both addresses are served by CachyOS and may share the same backend, so the fallback protects against one address being down or broken, not against wrong data. The Arch Linux API has no fallback.
-- **With the default blocking mode an API outage does not block**, even when the other API's lists were updated. The programs continue; the lists of the unavailable API keep the state of the last successful run. Only the strict modes `failure` and `partial` block in that case.
+- **An API outage blocks only in the strict modes `failure` and `partial`** (never with the default `DENY_ON=off`), even when the other API's lists were updated. In the other modes the programs continue; the lists of the unavailable API keep the state of the last successful run.
 - **Abbreviated long options** of `pacman` (such as `--syn`) are not recognized by `hm-daemon`.
 - **Blocking mode is a guard, not a security boundary.** See [Blocking mode](#blocking-mode-deny_on): it can be bypassed on purpose (retry within the cooldown), and it does not apply to requests beyond `MAX_HELD`, to programs that are not recognized as clients, or while the daemon is not running.
 
@@ -273,7 +288,7 @@ function up; hm; or test $status -eq 2; and sudo pacman -Syu $argv; end
 
 #### Variant: also continue when an API is unavailable
 
-To match the default mode of the daemon (an API outage is only a warning), accept status `3` too. `$?` is overwritten by every test, so it has to be saved in a variable first:
+To match the `mirrors-partial` blocking mode of the daemon (an API outage is only a warning), accept status `3` too. `$?` is overwritten by every test, so it has to be saved in a variable first:
 
 ```zsh
 up() { hm; local rc=$?; [ $rc -eq 0 ] || [ $rc -eq 2 ] || [ $rc -eq 3 ] || return $rc; sudo pacman -Syu "$@"; }
@@ -313,7 +328,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 - Requests from the daemon itself and from `hm` and its subprocesses are always allowed through, to avoid deadlocks.
 - A cooldown (default 60 s) prevents `hm` from running repeatedly. It also applies after a failed, partial or timed-out run. It is measured from the end of the run.
 - The `hm` timeout, the stop grace period and the periodic check use the monotonic clock, so a change of the system time (NTP correction after boot) cannot shorten or extend them; time spent suspended does not count as time `hm` has been running. The cooldown uses `CLOCK_BOOTTIME`: it is equally immune to changes of the system time, but it keeps counting while the system is suspended, so a program started after a resume is checked again if the cooldown ran out during the sleep.
-- **By default (`DENY_ON=mirrors-partial`) the daemon blocks the triggering programs when the mirror status was obtained but the lists could not be brought up to date**: `hm` found no healthy mirror (exit `1`) or skipped some lists (exit `2`). They then fail with `EPERM` (see [Blocking mode](#blocking-mode-deny_on)); a retry within the cooldown goes through. **If the mirror status of an API cannot be obtained (exit `3`, an API is down; the lists of the other API were still updated), or if `hm` times out or cannot be started, nothing is blocked**: you get a warning in the journal and a desktop notification, and the program continues with the existing lists. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run). With `DENY_ON=off` the daemon only guarantees a check before the operation, not that it succeeds: the waiting programs are always released and continue with the existing mirror lists.
+- **By default (`DENY_ON=off`) the daemon never blocks**: it guarantees a check before the operation, not that it succeeds. Whatever the result of `hm`, the waiting programs are released and continue with the existing mirror lists; a failure, a skipped list or an unavailable mirror status is shown as a warning in the journal and a desktop notification. `hm` leaves the mirrorlists as they were when it fails (they keep the state of the last successful run). **In a blocking mode** (see [Blocking mode](#blocking-mode-deny_on)) the daemon blocks the triggering programs on the results that the mode selects. For example with `DENY_ON=mirrors-partial`, when the mirror status was obtained but the lists could not be brought up to date (`hm` found no healthy mirror, exit `1`, or skipped some lists, exit `2`), they fail with `EPERM`; a retry within the cooldown goes through. In that mode, an unavailable mirror status (exit `3`, an API is down), an `hm` timeout or an `hm` that cannot be started do not block.
 - The daemon logs the outcome by `hm`'s exit status:
   - `0`: `hm finished OK`,
   - `2` (some lists skipped, the others updated): `hm skipped some mirror lists (exit code 2)` at warning priority. This is not logged as a failure,
@@ -331,7 +346,7 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 ### Blocking mode (`DENY_ON`)
 
-`DENY_ON` decides what happens to the programs that wait for `hm` when the lists could not be brought up to date. The default, `mirrors-partial`, makes sure that **nothing runs on lists that `hm` knows to be bad**, without making an unreachable API a reason to stop. A result of `hm` falls into one of these classes:
+`DENY_ON` decides what happens to the programs that wait for `hm` when the lists could not be brought up to date. The default, `off`, never blocks: the programs continue with the existing lists and the problem is only logged and notified. The blocking modes make sure that **nothing runs on lists that `hm` knows to be bad**; `mirrors-partial` does this without making an unreachable API a reason to stop. A result of `hm` falls into one of these classes:
 
 - **no healthy mirror / error**: `hm` exit `1`,
 - **partial**: `hm` exit `2` (some lists skipped),
@@ -340,13 +355,13 @@ An optional systemd service that uses Linux fanotify to hold attempts to open `/
 
 | `DENY_ON` | `hm` exit `0` | `hm` exit `2` (some lists skipped) | `hm` exit `1` (no healthy mirror / error) | `hm` exit `3` (API unavailable) | timeout, `hm` cannot be started |
 |---|---|---|---|---|---|
-| `off` | continue | continue | continue | continue | continue |
+| `off` (default) | continue | continue | continue | continue | continue |
 | `mirrors` | continue | continue | **blocked** | continue | continue |
-| `mirrors-partial` (default) | continue | **blocked** | **blocked** | continue | continue |
+| `mirrors-partial` | continue | **blocked** | **blocked** | continue | continue |
 | `failure` | continue | continue | **blocked** | **blocked** | **blocked** |
 | `partial` | continue | **blocked** | **blocked** | **blocked** | **blocked** |
 
-`mirrors` and `mirrors-partial` block only on a verdict about the mirrors: the API answered, and what it said leaves a list without usable healthy mirrors. They never block because of the network. `failure` and `partial` are the strict modes: they block whenever the check did not fully succeed, whatever the reason (also when only one of the two APIs was unavailable). `partial` additionally blocks on a single skipped list. `off` never blocks. If one list is permanently skipped (for example because the API data for it is wrong), `mirrors-partial` and `partial` make every first start fail once; `mirrors` or `failure` is the better choice then. Change it with `sudo hm-setup` or with a systemd drop-in:
+`mirrors` and `mirrors-partial` block only on a verdict about the mirrors: the API answered, and what it said leaves a list without usable healthy mirrors. They never block because of the network. `failure` and `partial` are the strict modes: they block whenever the check did not fully succeed, whatever the reason (also when only one of the two APIs was unavailable). `partial` additionally blocks on a single skipped list. `off`, the default, never blocks. If one list is permanently skipped (for example because the API data for it is wrong), `mirrors-partial` and `partial` make every first start fail once; `mirrors` or `failure` is the better choice then. Change it with `sudo hm-setup` or with a systemd drop-in:
 
 ```bash
 sudo systemctl edit hm-daemon.service
@@ -365,18 +380,19 @@ What "blocked" means: the daemon answers the waiting `open()` of `/etc/pacman.co
 
 **How you are told.**
 
-- Desktop notification (when `hm` is not run in a terminal, see [Error notifications](#error-notifications)): the daemon tells `hm` that blocking is on, so `hm`'s notification and its journal output add: *Programs waiting for this check were blocked (DENY_ON=...). Starting the program again within N s lets it continue with the existing mirror lists.* The sentence is added only when the mode really blocks for that outcome; with an API outage in the default mode you get the notification (`hm: mirror status unavailable`) without it.
+- Desktop notification (when `hm` is not run in a terminal, see [Error notifications](#error-notifications)): the daemon tells `hm` that blocking is on, so `hm`'s notification and its journal output add: *Programs waiting for this check were blocked (DENY_ON=...). Starting the program again within N s lets it continue with the existing mirror lists.* The sentence is added only when the mode really blocks for that outcome; with an API outage in the `mirrors-partial` mode you get the notification (`hm: mirror status unavailable`) without it.
 - Journal (`journalctl -u hm-daemon.service`): `hm FAILED (exit code N)`, `hm skipped some mirror lists (exit code 2)` or `hm could not get the mirror status (exit code 3)`, followed, when something was blocked, by `denying X of Y held open() calls (DENY_ON=..., pid ...): they fail with EPERM; starting the program again within N s lets it continue with the existing mirror lists`.
 
 **What is never blocked.**
 
+- With the default `DENY_ON=off`, nothing is blocked.
 - Stopping or restarting the daemon (`SIGTERM`, the end of `STOP_GRACE`) releases everything. A stop is not a failure of `hm`. This includes the case that `hm` is terminated by the same stop (exit code `-15` or `143`, logged as `hm was terminated`).
 - Requests beyond `MAX_HELD` are let through (availability over strictness).
 - If the daemon dies, the kernel allows all outstanding requests.
 - Programs that are not recognized as clients, and the operations that do not trigger `hm` (`pacman -Q`, ...).
 - A program that already has `pacman.conf` open or has read the lists before the daemon started: the guard only sees `open()` calls.
 - A run that used the fallback CachyOS API: it still ends with status `0`.
-- In the default mode and in `mirrors`: an API outage (exit `3`), a `hm` timeout and an `hm` that cannot be started.
+- In the `mirrors` and `mirrors-partial` modes: an API outage (exit `3`), a `hm` timeout and an `hm` that cannot be started.
 
 Known limitations of blocking mode:
 
@@ -419,7 +435,7 @@ Environment="HELPERS_RE=yay|paru"
 | `RECHECK` | `600` | Safety-net check (seconds) that every watched file is still marked and the directory watches exist; `0` disables it (≥ 0). Replacements are normally detected immediately via inotify |
 | `MAX_HELD` | `256` | Maximum number of `open()` calls held while `hm` runs; further ones are let through (integer ≥ 1) |
 | `STOP_GRACE` | `5` | Seconds a running `hm` may finish when the service is stopped (≥ 0) |
-| `DENY_ON` | `mirrors-partial` | `off`, `mirrors`, `mirrors-partial`, `failure` or `partial`: when to block the programs that triggered a `hm` run, see [Blocking mode](#blocking-mode-deny_on) |
+| `DENY_ON` | `off` | `off`, `mirrors`, `mirrors-partial`, `failure` or `partial`: when to block the programs that triggered a `hm` run, see [Blocking mode](#blocking-mode-deny_on) |
 
 Numbers must be finite; a value that does not match its constraint makes the service fail to start with a message such as `invalid MAX_HELD='0': must be an integer >= 1`. An unknown `DENY_ON` value is rejected the same way (`invalid DENY_ON='abc': must be one of off, mirrors, mirrors-partial, failure, partial`).
 
@@ -452,7 +468,7 @@ Using the fallback CachyOS API is not an error and sends no notification; it is 
 
 - When run as a regular user, `hm` calls `notify-send` directly.
 - When run as root (by the daemon), `hm` notifies every active user session, using `setpriv` to switch to that user. Delivery results and failures are written to the journal (`journalctl -u hm-daemon.service`).
-- When the daemon runs in a [blocking mode](#blocking-mode-deny_on) and the outcome blocks programs, the notification and the journal output also say so, and for how many seconds a retry gets through. When the outcome does not block in the configured mode (for example an API outage in the default mode), the notification is still shown but does not contain that sentence.
+- When the daemon runs in a [blocking mode](#blocking-mode-deny_on) and the outcome blocks programs, the notification and the journal output also say so, and for how many seconds a retry gets through. When the outcome does not block in the configured mode (for example an API outage in the `mirrors-partial` mode), the notification is still shown but does not contain that sentence.
 - Control: `HM_NOTIFY=auto|always|never` (default `auto`). Notifications are always off with `--dry-run` and `--list`. Send a test notification with `hm --notify-test`.
 
 ## Diagnostics
@@ -522,7 +538,7 @@ The script re-runs itself with `sudo` (fanotify permission events need root). It
 | 19 | Stopping the daemon with a held request never denies it |
 | 20 | `hm` receives `HM_DENY_ON` and `HM_DENY_RETRY` in deny mode, and neither otherwise (also not inherited from the daemon's environment) |
 | 21 | `DENY_ON` together with `COOLDOWN=0` produces a warning at startup |
-| 22 | The default is `DENY_ON=mirrors-partial`: without the variable a partial result is denied and the startup log names the mode |
+| 22 | The default is `DENY_ON=off`: without the variable even a failure is not denied and the startup log announces no deny mode |
 | 23 | A stop that also terminates `hm` (as systemd does for the whole service) never denies: the held request is allowed and `hm was terminated` is logged as a warning |
 | 24 | `hm` exits with `3` (mirror status unavailable): the default mode does not deny, and the outcome is logged as a warning, not as a failure |
 | 25 | `DENY_ON=mirrors`: exit `1` is denied, exit `2` and exit `3` are let through |
@@ -579,7 +595,7 @@ sudo hm --clean                   # removes the markers again
 journalctl -fu hm-daemon.service  # watch the daemon, e.g. while running `pacman -Sp firefox`
 ```
 
-To try the blocking mode by hand (it is on by default), make `hm` report a bad result, for example by choosing `DENY_ON=partial` and going offline (exit `3`, blocked only in the strict modes), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass. In the default mode going offline only produces the warning `hm could not get the mirror status (exit code 3)` and the program continues.
+To try the blocking mode by hand (it is off by default; enable a mode with `sudo hm-setup`), make `hm` report a bad result, for example by choosing `DENY_ON=partial` and going offline (exit `3`, blocked only in the strict modes), run `pacman -Sy` and watch the `denying ...` line in the journal; run it again within `COOLDOWN` seconds to see it pass. With the default `DENY_ON=off`, and in the `mirrors` and `mirrors-partial` modes, going offline only produces the warning `hm could not get the mirror status (exit code 3)` and the program continues.
 
 ## Repository files
 

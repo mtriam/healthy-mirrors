@@ -2,7 +2,7 @@
 
 pkgname=healthy-mirrors-git
 _pkgname=healthy-mirrors
-pkgver=r57.c8a0605
+pkgver=r62.ee2289d
 pkgrel=1
 pkgdesc='Keeps only healthy mirrors active in the CachyOS/Arch Linux mirrorlists, with an optional pacman guard daemon'
 arch=('any')

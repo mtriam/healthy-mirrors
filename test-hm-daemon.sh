@@ -366,10 +366,11 @@ start_daemon DENY_ON=failure
 grep -qF '<4>warning: DENY_ON is set with COOLDOWN=0' "$LOG" && ok "warning logged" || bad "warning missing"
 stop_daemon
 
-echo "== 22. the default is DENY_ON=mirrors-partial"
-start_daemon HM="$T/partial-hm"
-denied && ok "without DENY_ON a partial result is denied" || bad "default does not deny a partial result"
-grep -q 'DENY_ON=mirrors-partial:' "$LOG" && ok "startup log names the active mode" || bad "startup log does not name DENY_ON"
+echo "== 22. the default is DENY_ON=off"
+start_daemon HM="$T/fail-hm"
+denied && bad "without DENY_ON a failure was denied" || ok "without DENY_ON nothing is denied (the default is off)"
+grep -q 'DENY_ON=' "$LOG" && bad "startup log announces a deny mode although none is active" \
+                          || ok "startup log announces no deny mode"
 stop_daemon
 
 echo "== 23. a stop that also terminates hm (systemd signals the whole service) never denies"

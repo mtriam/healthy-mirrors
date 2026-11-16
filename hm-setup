@@ -183,7 +183,7 @@ RO="${RO% }"
 # ----------------------------------------------------------------------------- options
 CFG_ORDER=(DENY_ON COOLDOWN HM_TIMEOUT HELPERS_RE SHELLY_RE WATCH MAX_HELD STOP_GRACE RECHECK)
 declare -A CFG_DEF=(
-    [DENY_ON]=mirrors-partial
+    [DENY_ON]=off
     [COOLDOWN]=60
     [HM_TIMEOUT]=45
     [HELPERS_RE]='yay|paru|pikaur|trizen|octopi'
@@ -210,10 +210,12 @@ cfg_describe() {
     case $1 in
         DENY_ON) cat <<'EOF'
   What happens to pacman / yay / shelly when the mirror check does not succeed.
-  A blocked program fails at startup with "Operation not permitted". Starting it
-  again within COOLDOWN seconds lets it through with the existing mirror lists.
-  An unavailable mirror status (API down) only blocks in the strict modes failure
-  and partial; the mirrors modes only warn in that case.
+  By default (off) nothing is blocked: the program continues and the problem is
+  only logged and notified. In the blocking modes a blocked program fails at
+  startup with "Operation not permitted"; starting it again within COOLDOWN
+  seconds lets it through with the existing mirror lists. An unavailable mirror
+  status (API down) only blocks in the strict modes failure and partial; the
+  mirrors modes only warn in that case.
 EOF
         ;;
         COOLDOWN) cat <<'EOF'
@@ -400,9 +402,9 @@ ask_options() {
         if [[ $name == DENY_ON ]]; then
             echo
             tbl $'Value\tEffect when the check does not succeed' \
-                $'@g:off\tnever block: programs always continue, even with outdated lists' \
+                $'@g:off\t(default) never block: programs always continue, even with outdated lists' \
                 $'@g:mirrors\tblock only when the API works but no list has a healthy mirror (API outage: warning only)' \
-                $'@g:mirrors-partial\t(default) like mirrors, and also block when some list was skipped' \
+                $'@g:mirrors-partial\tlike mirrors, and also block when some list was skipped' \
                 $'@y:failure\tblock when the check failed for any reason, including an API outage or a timeout' \
                 $'@r:partial\tstrictest: like failure, and also block when some list was skipped'
         else
